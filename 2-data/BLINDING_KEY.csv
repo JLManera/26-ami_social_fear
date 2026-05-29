@@ -1,0 +1,6 @@
+variable,original,blinded
+treatment,c,TZ
+treatment,l,TX
+treatment,h,TY
+information,personal,IA
+information,social,IB

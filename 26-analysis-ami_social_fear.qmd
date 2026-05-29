@@ -1,0 +1,2023 @@
+---
+title: "fear-contagion-ami_analysis"
+author: "Jack L Manera"
+format: html
+---
+
+# 1. Setup
+
+## 1.1 Packages
+
+```{r packages}
+#If 'pacman' is not already installed please un-hash and run the line below
+#install.packages("pacman")
+#remotes::install_github("stan-dev/cmdstanr")
+
+pacman::p_load(tidyverse, ggplot2, brms, cmdstanr, bayestestR, tidybayes, ggpp, marginaleffects, grid, patchwork, officer, flextable, magick, cowplot, grateful, install = TRUE)
+
+#If 'cmdstan' is not already installed please un-hash and run the line below
+#install_cmdstan()
+
+# used to generate documentation of r package versions
+#cite_packages(out.dir = "./", out.format = "md", out.file = "r_package_versions")
+```
+
+## 1.2 Colour Palette
+
+```{r colour_palette}
+colour_treatment1 <- "#238f9d"
+colour_treatment2 <- "#f57634"
+colour_treatment3 <- "#a01813"
+
+colour_information1 <- "#8C1A63"
+colour_information2 <- "#244C8F" 
+
+colour_information1_light1 <- "#A33378"
+colour_information1_light2 <- "#ad5e8e"
+colour_information2_light1 <- "#3A63A6"
+colour_information2_light2 <- "#537BBC"
+
+colour_latency_to_move <- "#43A047"
+colour_time_to_recover <- "#1B5E20"
+```
+
+## 1.3 Helper Functions
+
+Two utility functions are defined here and applied uniformly throughout the document. `run_model_diagnostics()` provides a standardised validation workflow for any fitted Bayesian model: it checks MCMC chain convergence via trace plots, compares priors to posteriors through hypothesis tests, and assesses predictive fit with posterior predictive checks (density overlay, ECDF overlay, mean vs SD, and grouped means by information source). `add_pd()` appends the probability of direction to marginal contrast tables, providing a Bayesian analogue of a one-sided p-value.
+
+```{r}
+run_model_diagnostics <- function(model,
+                                  hypotheses = c(
+                                    "informationsocial > 0",
+                                    "treatmenth > 0",
+                                    "treatmentl > 0",
+                                    "informationsocial:treatmenth > 0",
+                                    "informationsoical:treatmentl > 0"
+                                  )) {
+  model_name <- deparse(substitute(model))
+  
+  
+  # Chain convergence
+  print(plot(model, ask = FALSE))
+  
+  # Prior vs posterior comparisons
+  for (h in hypotheses) {
+    tryCatch({
+      print(plot(hypothesis(model, h), main = h))
+    }, error = function(e) {
+      message(sprintf("⚠ Could not test hypothesis '%s': %s", h, e$message))
+    })
+  }
+  
+  
+  # Posterior predictive checks
+  # Density overlay
+  print(pp_check(model) + ggtitle("Posterior Predictive: Density Overlay"))
+  # ECDF overlay
+  print(pp_check(model, ndraws = 100, type = 'ecdf_overlay') + ggtitle("Posterior Predictive: ECDF Overlay"))
+  # 2D statistics
+  print(pp_check(model, type = "stat_2d", ndraws = 100) + ggtitle("Posterior Predictive: Mean vs SD"))
+  
+  # Grouped means
+  tryCatch({
+    print(
+      pp_check(model, type = "stat_grouped", group = "information", stat = "mean") + ggtitle(sprintf("Posterior Predictive: Grouped Means by information")))
+  }, error = function(e) {
+    message(sprintf("⚠ Could not create grouped plot: %s", e$message))
+  })
+}
+
+
+add_pd <- function(comparisons) {
+  comp_df <- as.data.frame(comparisons)
+  pd_df <- as.data.frame(p_direction(comparisons))
+
+  common_cols <- intersect(names(comp_df), names(pd_df))
+  
+  merged <- merge(comp_df, pd_df, by = common_cols, all.x = TRUE)
+  
+  return(merged)
+}
+```
+
+
+# 2. Data
+
+## 2.1 Load and Prepare Data
+
+The blinding key is read in first and used to decode the treatment and information condition labels, which were anonymised during data collection. The main summary dataset (`summary_data.csv`) is then joined to these keys and recoded: treatment and information are converted to labelled factors, censoring indicators are created for individuals that did not return to baseline within the 90-minute trial window, proportional covariates are derived, and day/trial/demonstrator identifiers are prefixed to avoid numeric coercion. Only trial-phase rows are retained, and columns unused in any downstream analysis are dropped.
+
+```{r}
+blinding_codes <- read_csv("2-data/BLINDING_KEY.csv")
+
+
+treatment_key <- blinding_codes |> filter(variable == "treatment") |> select(original, blinded)
+information_key <- blinding_codes |> filter(variable == "information") |> select(original, blinded)
+
+mean_df <- read_csv("./2-data/summary_data.csv") |>
+  left_join(treatment_key, by = c("treatment" = "blinded")) |>
+  rename(treatment_blinded = treatment, treatment = original) |>
+  left_join(information_key, by = c("information" = "blinded")) |>
+  rename(information_blinded = information, information = original) |>
+  mutate(demonstrator_id = paste0("id", demonstrator_id),
+         trial = paste0("trial", trial),
+         day = paste0("day", day),
+         treatment = factor(treatment, levels = c("c", "l", "h"), labels = c("Control", "Low", "High")),
+         information = factor(information, levels = c("personal", "social"), labels = c("Combined", "Social")),
+         recovery_time = ifelse(returned_to_baseline == FALSE, 90, recovery_time),
+         censored = ifelse(returned_to_baseline == FALSE, 1, 0),
+         recovery_time_demonstrators = ifelse(is.na(recovery_time_demonstrators), 90, recovery_time_demonstrators),
+         censored_demonstrator_recovery = ifelse(recovery_time_demonstrators == 90, 1, 0),
+         censored_demonstrator_moving = ifelse(latency_to_moving_demonstrators == 90, 1, 0),
+         latency_censored = ifelse(is.na(latency_to_moving), 1, 0),
+         latency_to_moving = ifelse(is.na(latency_to_moving), 90, latency_to_moving),
+         latency_to_moving_demonstrators = ifelse(is.na(latency_to_moving_demonstrators), 90, latency_to_moving_demonstrators),
+         recovery_time_binomial = recovery_time + 1,
+         prop_time_near_demonstrator_pre_recovery = time_near_demonstrator_pre_recovery/recovery_time_binomial,
+         prop_time_near_edge_pre_recovery = time_near_edge_pre_recovery/recovery_time_binomial
+         ) |> 
+  filter(phase == "trial") |> 
+  select(-c(recovery_time_ind2, recovery_time_ind3, recovery_time_ind4, treatment_blinded, information_blinded, duration_s, prop_time_moving, prop_time_moving_ind2, prop_time_moving_ind3, prop_time_moving_ind4, total_time_near_edge, prop_time_near_edge, mean_dist_to_edge_cm, total_time_near_demonstrator, prop_time_near_demonstrator, mean_dist_to_top_cm, recovery_similarity_before,  recovery_similarity_after,  returned_to_baseline_ind2, baseline_prop_moving_sd_ind2, returned_to_baseline_ind3, baseline_prop_moving_sd_ind3, returned_to_baseline_ind4, baseline_prop_moving_sd_ind4))
+
+global_temporal_df <- read_csv("./2-data/temporal_data.csv") |> 
+  filter(trial_time <= 90) |>
+  left_join(treatment_key, by = c("treatment" = "blinded")) |>
+  rename(treatment_blinded = treatment, treatment = original) |>
+  left_join(information_key, by = c("information" = "blinded")) |>
+  rename(information_blinded = information, information = original)
+
+mean_df |>
+  count(information, treatment)
+
+mean_df |>
+  count(day,camera)
+
+mean_df |> 
+  summarise(mean_weight = mean(weight, na.rm = TRUE),
+            sd_weight = sd(weight, na.rm = TRUE))
+
+```
+
+```{r}
+ggplot(data = mean_df, aes(x = latency_to_moving))
+```
+
+
+# 3. Reaction Time (Supplementary)
+
+This is a supplementary analysis. The timescale on which fish react to a threat — typically within seconds — is too fine-grained for reliable detection by the HMM-based behavioural state model, which operates on smoothed parameters with approximately one-second resolution. Any differences observed here should therefore be interpreted cautiously; the section is included for completeness rather than as a primary inferential target.
+
+```{r}
+reaction_time_df <- mean_df |> 
+  mutate(first_reaction_dems = pmin(reaction_time_ind2, reaction_time_ind3, reaction_time_ind4),
+    reaction_time_diff_first = first_reaction_dems - reaction_time_ind1)
+
+hist(reaction_time_df$reaction_time_diff_first, breaks = 100)
+```
+There is an important measurement limitation that complicates interpretation of reaction times. In some trials, the tracker takes up to a minute or so to lock onto the demonstrator fish, which creates leading missing values and can artificially inflate estimates of time to first freezing; in practice these missing values often persist until movement resumes. Although focal-fish tracks are reliable from the first frame, this issue makes accounting for demonstrator reaction times partly unreliable. The extreme values were reviewed manually, and one data point that clearly reflected this tracking artefact rather than true behaviour has been corrected below.
+
+```{r}
+reaction_time_df <- mean_df |>
+  mutate(
+    reaction_time_ind2 = ifelse(session_name == "d1-t1-TZ9-t-1TY2-d", 0, reaction_time_ind2),
+    first_reaction_dems = pmin(reaction_time_ind2, reaction_time_ind3, reaction_time_ind4),
+    reaction_time_diff_first = first_reaction_dems - reaction_time_ind1)
+
+hist(reaction_time_df$reaction_time_diff_first, breaks = 100)
+summary(reaction_time_df$reaction_time_diff_first)
+```
+
+In 9 out of 133 trials, the focal fish froze before any demonstrator, likely because it was picking up on subtler behavioural cues beyond freezing alone — including darting behaviour, in which fish rapidly burst around the tank. Additionally, demonstrators were housed with conspecifics and may have begun moving collectively before freezing, providing another source of early social information. For these reasons, reaction time is treated as a preliminary observation only, and results should be interpreted with caution.
+
+## 3.1 Model Formulae
+
+Two model families are compared for the reaction time difference (focal minus fastest demonstrator): a Gaussian and a Student-t. Both include information source, amitriptyline treatment, and their interaction as fixed effects, along with distance from demonstrators and body weight as covariates. Random effects account for day, trial nested within day, and demonstrator identity.
+
+```{r}
+reaction_time_formula_gaussian <- bf(
+  reaction_time_diff_first ~ 1 + treatment*information + scale(reaction_distance_from_dems)*information + scale(weight) + (1 | day/trial) + (1 | demonstrator_id),
+  family = gaussian()
+)
+
+reaction_time_formula_student <- bf(
+  reaction_time_diff_first ~ 1 + treatment*information + scale(reaction_distance_from_dems)*information + scale(weight) + (1 | day/trial) + (1 | demonstrator_id),
+  family = student()
+)
+```
+
+### 3.1.1 Fit Models
+
+```{r}
+reaction_time_model_gaussian <- brm(
+  reaction_time_formula_gaussian,
+  data = reaction_time_df, 
+  control = list(adapt_delta = 0.95, max_treedepth = 12), 
+  iter = 6000, warmup = 4000, 
+  threads = threading(2),
+  chains = 4, cores = 4,
+  file = "./2-data/4-models/reaction_time_model_gaussian", 
+  backend = 'cmdstanr',
+  save_pars = save_pars(all = TRUE),
+  seed = 9)
+
+reaction_time_model_student <- brm(
+  reaction_time_formula_student,
+  data = reaction_time_df, 
+  control = list(adapt_delta = 0.95, max_treedepth = 12), 
+  iter = 6000, warmup = 4000, 
+  threads = threading(2),
+  chains = 4, cores = 4,
+  file = "./2-data/4-models/reaction_time_model_student", 
+  backend = 'cmdstanr',
+  save_pars = save_pars(all = TRUE),
+  seed = 9)
+```
+
+### 3.1.2 Model Selection
+
+Posterior predictive checks are used to visually assess distributional fit. Predictive performance is then compared between candidate models using PSIS-LOO cross-validation.
+
+```{r}
+pp_check(reaction_time_model_gaussian)
+pp_check(reaction_time_model_student)
+```
+The student-t model did not fit adequately, due to the variance parameter approaching 1 and therefore collapsing to a gaussian distribution anyway.
+
+### 3.1.3 Effects
+
+*Model summary*
+
+```{r}
+reaction_time_model <- reaction_time_model_gaussian
+
+summary(reaction_time_model)
+bayes_R2(reaction_time_model)
+loo_R2(reaction_time_model)
+```
+
+*Focal predictors*
+
+```{r}
+# Average marginal means 
+reaction_time_marginalmeans <- avg_predictions(
+  reaction_time_model,
+  variables = c("information", "treatment"),
+  type = "response",
+  re_formula = NA)
+reaction_time_marginalmeans
+
+#contrasts
+reaction_time_contrasts_information <- avg_comparisons(
+  reaction_time_model,
+  variables = list(information = "pairwise"),
+  type = "response",
+  re_formula = NA) |> 
+  add_pd()
+reaction_time_contrasts_information
+
+reaction_time_contrasts_treatment <- avg_comparisons(
+  reaction_time_model,
+  variables = list(treatment = "pairwise"),
+  by = "information", 
+  type = "response",
+  re_formula = NA) |> 
+  add_pd()
+reaction_time_contrasts_treatment
+```
+
+*Covariate effects*
+
+```{r}
+reaction_time_covariate1 <- avg_slopes(
+  reaction_time_model,
+  variables = "weight",
+  type = "response",
+  re_formula = NA) |> 
+  add_pd()
+reaction_time_covariate1
+
+reaction_time_covariate2 <- avg_slopes(
+  reaction_time_model,
+  variables = "reaction_distance_from_dems",
+  type = "response",
+  re_formula = NA) |> 
+  add_pd()
+reaction_time_covariate2
+```
+
+### 3.1.4 Figures
+
+```{r}
+reaction_time_marginalmeans_draws <-  reaction_time_marginalmeans |>
+  get_draws() |> 
+  rename(reaction_time_ind1 = draw)
+
+reaction_time_plot <- ggplot(
+  data = reaction_time_df,
+  aes(x = information, y = reaction_time_ind1, colour = treatment, fill = treatment)
+) +
+  geom_boxplot(alpha = 0.2, width = 0.2, position = position_dodgenudge(width = 0.75, x = -0.04)) +
+  stat_halfeye(
+    data = reaction_time_marginalmeans_draws,
+    .width = 0.95,
+    alpha = 0.7,
+    position = position_dodgenudge(width = 0.75, x = 0.03),
+    width = 0.4
+  ) +
+  stat_halfeye(
+    data = reaction_time_marginalmeans_draws,
+    .width = 0.95,
+    fill = NA,
+    position = position_dodgenudge(width = 0.75, x = 0.03)
+  ) +
+  scale_colour_manual(values = c(colour_treatment1, colour_treatment2, colour_treatment3)) +
+  scale_fill_manual(values = c(colour_treatment1, colour_treatment2, colour_treatment3)) +
+  labs(y = "reaction time (sec)",
+       x = "Source of threat information",
+       colour = "Amitriptyline\nconcentration",
+       fill = "Amitriptyline\nconcentration") +
+  theme_classic() +
+  coord_cartesian(ylim = c(-7, 20))
+
+reaction_time_plot
+```
+
+# 4. Focal Fear Response
+
+## 4.1 Recovery Time
+
+Recovery time is defined as the time taken for the focal fish to return to a level of activity equal to its pre-trial baseline. The distribution is inspected below. This variable is right-censored because many individuals did not return to baseline within the 90-minute trial window; these fish are assigned the maximum value of 90 minutes and flagged with a censoring indicator.
+
+```{r}
+hist(mean_df$recovery_time)
+```
+
+A substantial proportion of fish did not recover within the trial window and are therefore right-censored. Two survival distributions are compared to account for this: a log-normal and a Weibull. Both models include information source, amitriptyline treatment, and their interaction as fixed effects, with body weight as a covariate. Random effects account for between-day variation, trial nested within day, and demonstrator identity.
+
+### 4.1.1 Model Formulae
+
+```{r}
+recovery_time_lognormal_formula <- bf(
+  recovery_time | cens(censored) ~ 1 + information * treatment + scale(weight) + (1 | day/trial) + (1 | demonstrator_id),
+  family = lognormal()
+)
+
+recovery_time_lognormal_sigma_formula <- bf(
+  recovery_time | cens(censored) ~ 1 + information * treatment + scale(weight) + (1 | day/trial) + (1 | demonstrator_id),
+  sigma ~ treatment*information,
+  family = lognormal()
+)
+
+recovery_time_weibull_formula <- bf(
+  recovery_time | cens(censored) ~ 1 + information * treatment + scale(weight) + (1 | day/trial) + (1 | demonstrator_id),
+  family = weibull()
+)
+
+recovery_time_weibull_shape_formula <- bf(
+  recovery_time | cens(censored) ~ 1 + information * treatment + scale(weight) + day + trial + (1 | demonstrator_id),
+  family = weibull()
+)
+```
+
+### 4.1.2 Fit Models
+
+```{r}
+recovery_time_lognormal_model <- brm(recovery_time_lognormal_formula, 
+  data = mean_df,
+  control = list(adapt_delta = 0.95, max_treedepth = 12), 
+  iter = 6000, warmup = 4000, 
+  threads = threading(2),
+  chains = 4, cores = 4,
+  backend = 'cmdstanr',
+  file = "./2-data/4-models/recovery_time_lognormal_model",
+  seed = 9)
+
+recovery_time_lognormal_sigma_model <- brm(recovery_time_lognormal_sigma_formula, 
+  data = mean_df,
+  control = list(adapt_delta = 0.95, max_treedepth = 12), 
+  iter = 6000, warmup = 4000, 
+  threads = threading(2),
+  chains = 4, cores = 4,
+  backend = 'cmdstanr',
+  file = "./2-data/4-models/recovery_time_lognormal_sigma_model",
+  seed = 9)
+
+recovery_time_weibull_model <- brm(recovery_time_weibull_formula, 
+  data = mean_df,
+  control = list(adapt_delta = 0.95, max_treedepth = 12), 
+  iter = 6000, warmup = 4000, 
+  threads = threading(2),
+  chains = 4, cores = 4,
+  backend = 'cmdstanr',
+  file = "./2-data/4-models/recovery_time_weibull_model",
+  seed = 9)
+
+recovery_time_weibull_shape_model <- brm(recovery_time_weibull_shape_formula, 
+  data = mean_df,
+  control = list(adapt_delta = 0.95, max_treedepth = 12), 
+  iter = 6000, warmup = 4000, 
+  threads = threading(2),
+  chains = 4, cores = 4,
+  backend = 'cmdstanr',
+  file = "./2-data/4-models/recovery_time_weibull_shape_model",
+  seed = 9)
+```
+
+### 4.1.3 Model Selection
+
+Predictive performance is compared between the log-normal and Weibull candidates using LOO cross-validation. Posterior predictive checks are used to assess distributional fit visually.
+
+```{r}
+recovery_time_lognormal_model <- add_criterion(recovery_time_lognormal_model, criterion = "loo")
+recovery_time_weibull_model <- add_criterion(recovery_time_weibull_model, criterion = "loo")
+recovery_time_lognormal_sigma_model <- add_criterion(recovery_time_lognormal_sigma_model, criterion = "loo")
+recovery_time_weibull_shape_model <- add_criterion(recovery_time_weibull_shape_model, criterion = "loo")
+
+loo_compare(recovery_time_lognormal_model, recovery_time_weibull_model, recovery_time_lognormal_sigma_model, recovery_time_weibull_shape_model)
+
+pp_check(recovery_time_weibull_shape_model)
+pp_check(recovery_time_weibull_model)
+```
+
+Both models show comparable predictive accuracy under LOO. The Weibull distribution is preferred because it avoids overestimating the variance and handles the censored upper tail more naturally.
+
+```{r}
+recovery_time_model <- recovery_time_weibull_model
+```
+
+### 4.1.4 Model Diagnostics
+
+The selected model is validated by checking MCMC chain convergence, comparing priors to posteriors, and running posterior predictive checks.
+
+```{r}
+run_model_diagnostics(recovery_time_model)
+```
+
+### 4.1.5 Effects
+
+The following chunks summarise model fit and quantify the effects of information source, amitriptyline treatment, and body weight using marginal means and contrasts derived from the fitted model.
+
+*Model summary*
+
+```{r}
+summary(recovery_time_model)
+bayes_R2(recovery_time_model)
+loo_R2(recovery_time_model)
+```
+
+*Focal predictors*
+
+```{r}
+# Average marginal means 
+recovery_time_marginalmeans <- avg_predictions(
+  recovery_time_model,
+  variables = c("information", "treatment"),
+  type = "response",
+  re_formula = NA)
+recovery_time_marginalmeans
+
+avg_predictions(
+  recovery_time_model,
+  variables = c("information"),
+  type = "response",
+  re_formula = NA)
+
+#contrasts
+recovery_time_contrasts_information <- avg_comparisons(
+  recovery_time_model,
+  variables = list(information = "pairwise"),
+  type = "response",
+  re_formula = NA) |> 
+  add_pd()
+recovery_time_contrasts_information
+
+recovery_time_contrasts_treatment <- avg_comparisons(
+  recovery_time_model,
+  variables = list(treatment = "pairwise"),
+  by = "information", 
+  type = "response",
+  re_formula = NA) |> 
+  add_pd()
+recovery_time_contrasts_treatment
+
+avg_comparisons(
+  recovery_time_model,
+  variables = list(information = "pairwise"),
+  by = "treatment", 
+  type = "response",
+  re_formula = NA) |> 
+  add_pd()
+```
+
+*Covariate effects*
+
+```{r}
+recovery_time_covariate <- avg_slopes(recovery_time_model, variables = "weight", 
+           type = "response",
+           re_formula = NA) |> add_pd()
+
+recovery_time_covariate
+```
+
+*Variance effects*
+
+Average marginal means on the dispersion submodel (shape parameter)
+NOTE: For brms Weibull, higher shape = LESS variability (tighter distribution). A treatment that *increases* behavioural variability will show a *negative*  contrast on shape. We report shape on the response scale; interpretation of contrasts is reversed relative to the location (mu) submodel.
+
+```{r}
+recovery_time_shape_marginalmeans <- avg_predictions(
+  recovery_time_model,
+  variables = c("information"),
+  type = "response",
+  dpar = "shape",
+  re_formula = NA)
+recovery_time_shape_marginalmeans
+
+# Contrasts on the shape parameter
+recovery_time_shape_contrasts_information <- avg_comparisons(
+  recovery_time_model,
+  variables = list(information = "pairwise"),
+  type = "response",
+  dpar = "shape",
+  re_formula = NA) |> 
+  add_pd()
+recovery_time_shape_contrasts_information
+```
+
+
+### 4.1.6 Figures
+
+*Treatment × information effects plot*
+
+```{r}
+pos_box <- position_dodgenudge(width = 0.85, x = -0.04)
+pos_eye <- position_dodgenudge(width = 0.85, x = 0.05)
+
+recovery_time_marginalmeans_draws <-  recovery_time_marginalmeans |>
+  get_draws() |> 
+  rename(recovery_time = draw)
+
+recovery_time_plot <- ggplot(
+  data = mean_df,
+  aes(x = information, y = recovery_time, colour = treatment, fill = treatment)
+) +
+  geom_boxplot(alpha = 0.2, width = 0.2, position = pos_box) +
+  stat_halfeye(
+    data = recovery_time_marginalmeans_draws,
+    .width = 0.95,
+    slab_alpha = 0.7,
+    position = pos_eye,
+    width = 0.4
+  ) +
+  scale_colour_manual(
+    aesthetics = c("colour", "fill"),
+    values = c(colour_treatment1, colour_treatment2, colour_treatment3), labels = c("Unexposed", "Low", "High")
+  ) +
+  labs(
+    y = "Latency to fully recover\n(min)",
+    x = "Source of threat information",
+    colour = "Amitriptyline\nconcentration",
+    fill = "Amitriptyline\nconcentration"
+  ) +
+  theme_classic() +
+  coord_cartesian(ylim = c(0, 170))
+recovery_time_plot
+```
+
+```{r}
+recovery_time_plot_means <- mean_df |> 
+  group_by(information, treatment) |> 
+  summarise(mean_recovery = mean(recovery_time, na.rm = TRUE),
+            .groups = "drop")
+
+ggplot(data = mean_df, aes(x = information, y = recovery_time, colour = treatment, fill = treatment)) +
+  geom_boxplot(alpha = 0.2, width = 0.2, position = position_dodgenudge(width = 0.75, x = -0.04)) +
+  stat_halfeye(
+    data = recovery_time_marginalmeans_draws,
+    .width = 0.95,
+    alpha = 0.7,
+    position = position_dodgenudge(width = 0.75, x = 0.03),
+    width = 0.4
+  ) +
+  stat_halfeye(
+    data = recovery_time_marginalmeans_draws,
+    .width = 0.95,
+    fill = NA,
+    position = position_dodgenudge(width = 0.75, x = 0.03)
+  ) +
+  scale_colour_manual(values = c(colour_treatment1, colour_treatment2, colour_treatment3)) +
+  scale_fill_manual(values = c(colour_treatment1, colour_treatment2, colour_treatment3)) +
+  labs(y = "Time taken to return to baseline (min)",
+       x = "Source of threat information",
+       colour = "Amitriptyline\nconcentration",
+       fill = "Amitriptyline\nconcentration") +
+  theme_classic() +
+  coord_cartesian(ylim = c(0, 250))
+
+ggplot(data = mean_df, aes(x = information, y = recovery_time, colour = treatment, fill = treatment)) +
+  geom_jitter(alpha = 0.3, position = position_jitterdodge(jitter.width = 0.15, dodge.width = 0.75)) +
+  geom_point(data = recovery_time_plot_means, aes(y = mean_recovery), size = 3, shape = 23, colour = "black", position = position_dodge(width = 0.75)) +
+  stat_halfeye(
+    data = recovery_time_marginalmeans_draws,
+    .width = 0.95,
+    alpha = 0.7,
+    position = position_dodgenudge(width = 0.75, x = 0.07),
+    width = 0.4
+  ) +
+  stat_halfeye(
+    data = recovery_time_marginalmeans_draws,
+    .width = 0.95,
+    fill = NA,
+    position = position_dodgenudge(width = 0.75, x = 0.07)
+  ) +
+  scale_colour_manual(values = c(colour_treatment1, colour_treatment2, colour_treatment3)) +
+  scale_fill_manual(values = c(colour_treatment1, colour_treatment2, colour_treatment3)) +
+  labs(y = "Time taken to return to baseline (sec)",
+       x = "Source of threat information",
+       colour = "Amitriptyline\nconcentration",
+       fill = "Amitriptyline\nconcentration") +
+  theme_classic() +
+  coord_cartesian(ylim = c(0, 250))
+
+ggplot(data = mean_df, aes(x = information, y = recovery_time, colour = treatment, fill = treatment)) +
+  geom_boxplot(alpha = 0.4, width = 0.2, colour = "black", position = position_dodgenudge(width = 0.75, x = -0.04)) +
+  stat_halfeye(
+    data = recovery_time_marginalmeans_draws,
+    .width = 0.95,
+    alpha = 0.7,
+    position = position_dodgenudge(width = 0.75, x = 0.03),
+    width = 0.4
+  ) +
+  stat_halfeye(
+    data = recovery_time_marginalmeans_draws,
+    .width = 0.95,
+    fill = NA,
+    position = position_dodgenudge(width = 0.75, x = 0.03)
+  ) +
+  scale_colour_manual(values = c(colour_treatment1, colour_treatment2, colour_treatment3)) +
+  scale_fill_manual(values = c(colour_treatment1, colour_treatment2, colour_treatment3)) +
+  labs(y = "Time taken to return to baseline (min)",
+       x = "Source of threat information",
+       colour = "Amitriptyline\nconcentration",
+       fill = "Amitriptyline\nconcentration") +
+  theme_classic() +
+  coord_cartesian(ylim = c(0, 250))
+
+ggplot(data = mean_df, aes(x = information, y = recovery_time, colour = treatment, fill = treatment)) +
+  geom_boxplot(alpha = 0.2, width = 0.2, position = position_dodgenudge(width = 0.75, x = -0.04)) +
+  geom_point(data = recovery_time_plot_means, aes(y = mean_recovery), size = 3, shape = 23, colour = "black", position = position_dodge(width = 0.75)) +
+  stat_halfeye(
+    data = recovery_time_marginalmeans_draws,
+    .width = 0.95,
+    alpha = 0.7,
+    position = position_dodgenudge(width = 0.75, x = 0.03),
+    width = 0.4
+  ) +
+  stat_halfeye(
+    data = recovery_time_marginalmeans_draws,
+    .width = 0.95,
+    fill = NA,
+    position = position_dodgenudge(width = 0.75, x = 0.03)
+  ) +
+  scale_colour_manual(values = c(colour_treatment1, colour_treatment2, colour_treatment3)) +
+  scale_fill_manual(values = c(colour_treatment1, colour_treatment2, colour_treatment3)) +
+  labs(y = "Time taken to return to baseline (min)",
+       x = "Source of threat information",
+       colour = "Amitriptyline\nconcentration",
+       fill = "Amitriptyline\nconcentration") +
+  theme_classic() +
+  coord_cartesian(ylim = c(0, 250))
+```
+
+## 4.2 Latency to Resume Moving
+
+The distribution of latency to resume moving is inspected below. This variable captures the time from cue administration until the focal fish first resumed active movement, and is right-censored for individuals that never resumed movement within the 90-minute trial window.
+
+```{r}
+hist(mean_df$latency_to_moving)
+summary(mean_df$latency_to_moving)
+```
+
+### 4.2.1 Model Formulae
+
+Two hurdle log-normal models are compared. Model 1 uses a common linear predictor for both the hurdle (probability of never resuming movement) and the continuous component. Model 2 fits the hurdle sub-model separately, allowing the zero-inflation component to depend on its own linear predictor, including an interaction between information and treatment.
+
+```{r}
+latency_to_moving_lognormal_formula1 <- bf(
+  latency_to_moving | cens(latency_censored) ~ 1 + information*treatment + scale(baseline_prop_moving_mean) + scale(weight) + (1 | day/trial) + (1 | demonstrator_id),
+  family = hurdle_lognormal()
+)
+
+latency_to_moving_lognormal_formula2 <-  bf(
+  latency_to_moving | cens(latency_censored) ~ 1 + information*treatment + scale(baseline_prop_moving_mean) + scale(weight) + (1 | day/trial) + (1 | demonstrator_id),
+  hu ~ 1 + information*treatment + scale(baseline_prop_moving_mean),
+  family = hurdle_lognormal()
+)
+```
+
+### 4.2.2 Fit Models
+
+```{r}
+latency_to_moving_lognormal_model1 <- brm(latency_to_moving_lognormal_formula1, 
+  data = mean_df,
+  control = list(adapt_delta = 0.95, max_treedepth = 12), 
+  iter = 6000, warmup = 4000, 
+  threads = threading(2),
+  chains = 4, cores = 4,
+  backend = 'cmdstanr',
+  file = "./2-data/4-models/latency_to_moving_lognormal_model1",
+  seed = 9)
+
+latency_to_moving_lognormal_model2 <- brm(latency_to_moving_lognormal_formula2, 
+  data = mean_df,
+  control = list(adapt_delta = 0.95, max_treedepth = 12), 
+  iter = 6000, warmup = 4000, 
+  threads = threading(2),
+  chains = 4, cores = 4,
+  backend = 'cmdstanr',
+  file = "./2-data/4-models/latency_to_moving_lognormal_model2",
+  seed = 9)
+```
+
+### 4.2.3 Model Selection
+
+Predictive performance is compared between the two hurdle log-normal models using PSIS-LOO cross-validation, supplemented by posterior predictive checks.
+
+```{r}
+latency_to_moving_lognormal_model1 <- add_criterion(latency_to_moving_lognormal_model1, criterion = "loo")
+latency_to_moving_lognormal_model2 <- add_criterion(latency_to_moving_lognormal_model2, criterion = "loo")
+
+loo_compare(latency_to_moving_lognormal_model1, latency_to_moving_lognormal_model2)
+
+pp_check(latency_to_moving_lognormal_model1)
+pp_check(latency_to_moving_lognormal_model2)
+```
+
+Both models show comparable predictive performance. The simpler model with a shared predictor structure (Model 1) is selected for inference.
+
+```{r}
+latency_to_moving_model <- latency_to_moving_lognormal_model1
+```
+
+### 4.2.4 Model Diagnostics
+
+The selected model is validated by checking MCMC chain convergence, comparing priors to posteriors, and running posterior predictive checks.
+
+```{r}
+run_model_diagnostics(latency_to_moving_model)
+```
+
+### 4.2.5 Effects
+
+*Model summary*
+
+```{r}
+summary(latency_to_moving_model)
+bayes_R2(latency_to_moving_model)
+loo_R2(latency_to_moving_model)
+```
+
+*Focal predictors*
+
+```{r}
+# Average marginal means 
+latency_to_moving_marginalmeans <- avg_predictions(
+  latency_to_moving_model,
+  variables = c("information", "treatment"),
+  type = "response",
+  re_formula = NA)
+latency_to_moving_marginalmeans
+
+#contrasts
+latency_to_moving_contrasts_information <- avg_comparisons(
+  latency_to_moving_model,
+  variables = list(information = "pairwise"),
+  type = "response",
+  re_formula = NA) |> 
+  add_pd()
+latency_to_moving_contrasts_information
+
+latency_to_moving_contrasts_treatment <- avg_comparisons(
+  latency_to_moving_model,
+  variables = list(treatment = "pairwise"),
+  by = "information", 
+  type = "response",
+  re_formula = NA) |> 
+  add_pd()
+latency_to_moving_contrasts_treatment
+
+avg_comparisons(
+  latency_to_moving_model,
+  variables = list(information = "pairwise"),
+  by = "treatment", 
+  type = "response",
+  re_formula = NA) |> 
+  add_pd()
+```
+
+*Covariate effects*
+
+```{r}
+latency_to_moving_covariate <- avg_slopes(latency_to_moving_model, variables = "weight",
+           type = "response",
+           re_formula = NA) |> add_pd()
+latency_to_moving_covariate
+```
+
+### 4.2.6 Figures
+
+*Treatment × information effects plot*
+
+```{r}
+latency_to_moving_marginalmeans_draws <-  latency_to_moving_marginalmeans |>
+  get_draws() |> 
+  rename(latency_to_moving = draw)
+
+latency_to_moving_plot <- ggplot(
+  data = mean_df,
+  aes(x = information, y = latency_to_moving, colour = treatment, fill = treatment)
+) +
+  geom_boxplot(alpha = 0.2, width = 0.2, position = pos_box) +
+  stat_halfeye(
+    data = latency_to_moving_marginalmeans_draws,
+    .width = 0.95,
+    slab_alpha = 0.7,
+    position = pos_eye,
+    width = 0.3
+  ) +
+  scale_colour_manual(
+    aesthetics = c("colour", "fill"),
+    values = c(colour_treatment1, colour_treatment2, colour_treatment3)
+  ) +
+  scale_x_discrete(labels = c("Combined\ninformation", "Social\ninformation")) +
+  labs(
+    y = "Latency to resume\nmoving (min)",
+    x = "Source of information",
+    colour = "Amitriptyline\nconcentration",
+    fill = "Amitriptyline\nconcentration"
+  ) +
+  theme_classic() +
+  coord_cartesian(ylim = c(0, 90))
+
+latency_to_moving_plot
+```
+
+# 5. Demonstrator Fear Response
+
+Demonstrator recovery time is not analysed here because calculating individual baseline behavioural profiles for demonstrators is complicated by the potential for identity swaps between individuals during recording. We therefore focus solely on latency to resume moving. This section tests for social buffering: demonstrators received the same alarm cue across all information conditions, but in the social condition they could observe a focal fish that was naive to the threat, while in the personal condition they could only observe a fellow alarmed fish. If social buffering occurs, differences between information conditions — and potentially treatment effects within the social condition — should be detectable in the demonstrators' recovery latencies.
+
+## 5.1 Latency to Resume Moving
+
+The distribution of demonstrator latency to resume moving is inspected on the log scale. Two model families are compared — a hurdle log-normal and a shifted log-normal — to determine the best-fitting distribution for the censored data.
+
+```{r}
+hist(log(mean_df$latency_to_moving_demonstrators))
+```
+
+### 5.1.1 Model Formulae
+
+Fixed effects are information source and amitriptyline treatment (and their interaction), without a body weight covariate since demonstrators are not individually weighed. Random effects account for day, trial nested within day, and demonstrator identity.
+
+```{r}
+latency_to_moving_lognormal_formula_demonstrators <- bf(
+  latency_to_moving_demonstrators | cens(censored_demonstrator_moving) ~ 1 + information*treatment + (1 | day/trial) + (1 | demonstrator_id),
+  family = hurdle_lognormal()
+)
+
+latency_to_moving_weibull_formula_demonstrators <-  bf(
+  (latency_to_moving_demonstrators+0.001) | cens(censored_demonstrator_moving) ~ 1 + information*treatment + (1 | day/trial) + (1 | demonstrator_id),
+  family = lognormal()
+)
+```
+
+### 5.1.2 Fit Models
+
+```{r}
+latency_to_moving_lognormal_model_demonstrators <- brm(latency_to_moving_lognormal_formula_demonstrators, 
+  data = mean_df,
+  control = list(adapt_delta = 0.95, max_treedepth = 12), 
+  iter = 6000, warmup = 4000, 
+  threads = threading(2),
+  chains = 4, cores = 4,
+  backend = 'cmdstanr',
+  file = "./2-data/4-models/latency_to_moving_lognormal_model_demonstrators",
+  seed = 9)
+
+latency_to_moving_weibull_model_demonstrators <- brm(latency_to_moving_weibull_formula_demonstrators, 
+  data = mean_df,
+  control = list(adapt_delta = 0.95, max_treedepth = 12), 
+  iter = 6000, warmup = 4000, 
+  threads = threading(2),
+  chains = 4, cores = 4,
+  backend = 'cmdstanr',
+  file = "./2-data/4-models/latency_to_moving_weibull_model_demonstrators",
+  seed = 9)
+```
+
+### 5.1.3 Model Selection
+
+Predictive performance is compared between the hurdle log-normal and shifted log-normal using PSIS-LOO cross-validation, supplemented by posterior predictive checks.
+
+```{r}
+latency_to_moving_lognormal_model_demonstrators <- add_criterion(latency_to_moving_lognormal_model_demonstrators, criterion = "loo")
+latency_to_moving_weibull_model_demonstrators <- add_criterion(latency_to_moving_weibull_model_demonstrators, criterion = "loo")
+
+loo_compare(latency_to_moving_lognormal_model_demonstrators, latency_to_moving_weibull_model_demonstrators)
+
+pp_check(latency_to_moving_lognormal_model_demonstrators)
+pp_check(latency_to_moving_weibull_model_demonstrators)
+```
+
+Both models show comparable predictive performance. The hurdle log-normal is selected as it provides a more principled treatment of the censored tail.
+
+```{r}
+latency_to_moving_model_demonstrators <- latency_to_moving_lognormal_model_demonstrators
+```
+
+### 5.1.4 Model Diagnostics
+
+The selected model is validated by checking MCMC chain convergence, comparing priors to posteriors, and running posterior predictive checks.
+
+```{r}
+run_model_diagnostics(latency_to_moving_model_demonstrators)
+```
+
+### 5.1.5 Effects
+
+*Model summary*
+
+```{r}
+summary(latency_to_moving_model_demonstrators)
+bayes_R2(latency_to_moving_model_demonstrators)
+loo_R2(latency_to_moving_model_demonstrators)
+```
+
+*Focal predictors*
+
+```{r}
+# Average marginal means 
+latency_to_moving_marginalmeans_demonstrators <- avg_predictions(
+  latency_to_moving_model_demonstrators,
+  variables = c("information", "treatment"),
+  type = "response",
+  re_formula = NA)
+latency_to_moving_marginalmeans_demonstrators
+
+#contrasts
+latency_to_moving_contrasts_information_demonstrators <- avg_comparisons(
+  latency_to_moving_model_demonstrators,
+  variables = list(information = "pairwise"),
+  type = "response",
+  re_formula = NA) |> 
+  add_pd()
+latency_to_moving_contrasts_information_demonstrators
+
+latency_to_moving_contrasts_treatment_demonstrators <- avg_comparisons(
+  latency_to_moving_model_demonstrators,
+  variables = list(treatment = "pairwise"),
+  by = "information", 
+  type = "response",
+  re_formula = NA) |> 
+  add_pd()
+latency_to_moving_contrasts_treatment_demonstrators
+
+avg_comparisons(
+  latency_to_moving_model_demonstrators,
+  variables = list(information = "pairwise"),
+  by = "treatment", 
+  type = "response",
+  re_formula = NA) |> 
+  add_pd()
+```
+
+### 5.1.6 Figures
+
+*Treatment × information effects plot*
+
+```{r}
+latency_to_moving_marginalmeans_draws_demonstrators <-  latency_to_moving_marginalmeans_demonstrators |>
+  get_draws() |> 
+  rename(latency_to_moving_demonstrators = draw)
+
+latency_to_moving_plot_demonstrators <- ggplot(
+  data = mean_df,
+  aes(x = information, y = latency_to_moving_demonstrators, colour = treatment, fill = treatment)
+) +
+  geom_boxplot(alpha = 0.2, width = 0.2, position = pos_box) +
+  stat_halfeye(
+    data = latency_to_moving_marginalmeans_draws_demonstrators,
+    .width = 0.95,
+    slab_alpha = 0.7,
+    position = pos_eye,
+    width = 0.3
+  ) +
+  scale_colour_manual(
+    aesthetics = c("colour", "fill"),
+    values = c(colour_treatment1, colour_treatment2, colour_treatment3)
+  ) +
+  scale_x_discrete(labels = c("Combined\ninformation", "Social\ninformation")) +
+  labs(
+    y = "Latency to resume\nmoving (min)",
+    x = "Source of information",
+    colour = "Amitriptyline\nconcentration",
+    fill = "Amitriptyline\nconcentration"
+  ) +
+  theme_classic() +
+  coord_cartesian(ylim = c(0, 90))
+
+latency_to_moving_plot_demonstrators
+```
+
+# 6. Behavioural Synchrony
+
+These analyses quantify the extent to which the focal fish synchronised its fear response with the demonstrators. Two complementary approaches are used: the rank order in which the focal fish resumed movement relative to the three demonstrators (an ordinal response), and the raw difference in latency to resume moving between the focal fish and the fastest demonstrator (a continuous response).
+
+## 6.1 Order to Resume Moving
+
+The focal fish's rank position for resuming movement is computed across the group of four fish (one focal + three demonstrators) per trial. A rank of 1 indicates the focal fish recovered first; a rank of 4 indicates it recovered last. Missing latency values for demonstrators are treated as censored at 90 minutes before ranking. This ordinal outcome is modelled with a cumulative logit (proportional odds) regression.
+
+```{r}
+ordinal_df <- mean_df |>
+  mutate(latency_to_moving_ind2 = ifelse(is.na(latency_to_moving_ind2), 90, latency_to_moving_ind2),
+         latency_to_moving_ind3 = ifelse(is.na(latency_to_moving_ind3), 90, latency_to_moving_ind3),
+         latency_to_moving_ind4 = ifelse(is.na(latency_to_moving_ind4), 90, latency_to_moving_ind4)) |> 
+  rowwise() |>
+  mutate(
+    order_to_resume_moving = {
+      vals <- c(latency_to_moving_ind2,
+                latency_to_moving_ind3,
+                latency_to_moving_ind4)
+
+      if (is.na(latency_to_moving)) {
+        NA_integer_
+      } else {
+        rank(c(latency_to_moving, vals),
+             na.last = "keep",
+             ties.method = "min")[1]
+      }
+    }
+  ) |>
+  ungroup() |>
+  mutate(order_to_resume_moving = ordered(order_to_resume_moving))
+```
+
+### 6.1.1 Model Formula
+
+```{r}
+order_to_resume_moving_formula <- bf(
+  order_to_resume_moving ~ 1 + information * treatment + scale(weight) + (1 | day/trial) + (1 | demonstrator_id),
+  family = cumulative("logit")
+)
+```
+
+### 6.1.2 Fit Model
+
+```{r}
+order_to_resume_moving_model <- brm(order_to_resume_moving_formula, 
+  data = ordinal_df,
+  control = list(adapt_delta = 0.95, max_treedepth = 12), 
+  iter = 6000, warmup = 4000, 
+  threads = threading(2),
+  chains = 4, cores = 4,
+  backend = 'cmdstanr',
+  file =  "./2-data/4-models/order_to_resume_moving_model",
+  seed = 9)
+```
+
+### 6.1.3 Model Diagnostics
+
+The model is validated by checking MCMC chain convergence, comparing priors to posteriors, and running posterior predictive checks.
+
+```{r}
+run_model_diagnostics(order_to_resume_moving_model)
+```
+
+### 6.1.4 Effects
+
+*Model summary*
+
+```{r}
+summary(order_to_resume_moving_model)
+bayes_R2(order_to_resume_moving_model)
+loo_R2(order_to_resume_moving_model)
+```
+
+*Focal predictors*
+
+```{r}
+# Average marginal means 
+order_to_resume_moving_marginalmeans <- avg_predictions(
+  order_to_resume_moving_model,
+  variables = c("information", "treatment"),
+  type = "response",
+  re_formula = NA)
+order_to_resume_moving_marginalmeans
+
+#contrasts
+order_to_resume_moving_contrasts_information <- avg_comparisons(
+  order_to_resume_moving_model,
+  variables = list(information = "pairwise"),
+  type = "response",
+  re_formula = NA) |> 
+  add_pd()
+order_to_resume_moving_contrasts_information
+
+order_to_resume_moving_contrasts_treatment <- avg_comparisons(
+  order_to_resume_moving_model,
+  variables = list(treatment = "pairwise"),
+  by = "information", 
+  type = "response",
+  re_formula = NA) |> 
+  add_pd()
+order_to_resume_moving_contrasts_treatment
+```
+
+*Covariates*
+```{r}
+order_to_resume_moving_covariate <- avg_slopes(order_to_resume_moving_model, variables = "weight", re_formula = NA, type = "response") |> add_pd()
+order_to_resume_moving_covariate
+```
+*Averaged*
+Because the outcome is modelled with a cumulative logit, marginaleffects returns predictions, contrasts, and slopes on the probability scale separately for each ordinal category — one row per rank level per condition. To obtain marginal effects on the outcome scale (a single number per condition or contrast, marginalised across rank levels) we convert per-category posterior draws into expected ordinal values, E[Y | x] = Σₖ k · P(Y = k | x), on each draw, then summarise — or take pairwise contrasts — on that expected-value scale. The helpers below perform the conversion (to_expected) and the tidy summary including 95% HDI and posterior probability of direction (summ_draws).
+
+Some helper functions
+```{r}
+# Turn marginaleffects per-category draws into expected-value draws
+to_expected <- function(me_obj, by = NULL) {
+  me_obj |>
+    posterior_draws() |>
+    mutate(ord_cat = as.integer(as.character(group))) |>
+    group_by(across(all_of(c("drawid", by)))) |>
+    summarise(expected_order = sum(ord_cat * draw), .groups = "drop")
+}
+
+# Median + 95% HDI + posterior probability of direction
+summ_draws <- function(d, ..., val = expected_order) {
+  val <- rlang::enquo(val)
+  d |>
+    group_by(...) |>
+    summarise(
+      estimate = median(!!val),
+      conf.low = quantile(!!val, 0.025),
+      conf.high = quantile(!!val, 0.975),
+      pd = max(mean(!!val > 0), mean(!!val < 0)),
+      .groups = "drop"
+    )
+}
+```
+
+
+```{r}
+order_to_resume_moving_marginalmeans_single <- order_to_resume_moving_marginalmeans |>
+  to_expected(by = c("information", "treatment")) |>
+  summ_draws(information, treatment)
+order_to_resume_moving_marginalmeans_single
+
+order_to_resume_moving_contrasts_information_single <- order_to_resume_moving_marginalmeans |>
+  to_expected(by = "information") |>
+  compare_levels(expected_order, by = information, draw_indices = "drawid") |>
+  summ_draws(information)
+order_to_resume_moving_contrasts_information_single
+
+order_to_resume_moving_contrasts_treatment_single <- order_to_resume_moving_marginalmeans |>
+  to_expected(by = c("information", "treatment")) |>
+  group_by(drawid, information) |>
+  compare_levels(expected_order, by = treatment, draw_indices = "drawid") |>
+  summ_draws(information, treatment)
+order_to_resume_moving_contrasts_treatment_single
+```
+
+```{r}
+order_to_resume_moving_covariate_single <- avg_slopes(
+  order_to_resume_moving_model,
+  variables = "weight",
+  type = "response",
+  re_formula = NA) |>
+  to_expected(by = NULL) |>
+  summ_draws()
+order_to_resume_moving_covariate_single
+```
+
+
+### 6.1.5 Figures
+
+*Treatment × information estimates plot*
+
+```{r}
+K <- nlevels(ordinal_df$order_to_resume_moving)
+
+ord_all_draws <- order_to_resume_moving_marginalmeans |>
+  to_expected(by = c("information", "treatment"))
+
+ordinal_df <- ordinal_df |>
+  mutate(order_to_resume_moving_num = as.integer(order_to_resume_moving))
+
+ord_expected_plot <- ggplot(data = ordinal_df, aes(x = information, y = order_to_resume_moving_num, colour = treatment, fill = treatment)) +
+  geom_boxplot(alpha = 0.2, width = 0.2, position = pos_box) +
+  stat_halfeye(
+    data = ord_all_draws,
+    aes(y = expected_order),
+    .width = 0.95,
+    slab_alpha = 0.7,
+    width = 0.3,
+    position = pos_eye
+  ) +
+  scale_colour_manual(
+    aesthetics = c("colour", "fill"),
+    values = c(colour_treatment1, colour_treatment2, colour_treatment3)) +
+  scale_y_continuous(breaks = 1:K, limits = c(1, K)) +
+  labs(
+    y = "Expected order to\nresume moving",
+    x = "Source of information",
+    colour = "Amitriptyline\nconcentration",
+    fill = "Amitriptyline\nconcentration") +
+  theme_classic()
+
+ord_expected_plot
+```
+
+```{r}
+ord_prob_draws <- avg_predictions(
+  order_to_resume_moving_model,
+  variables = c("information", "treatment"),
+  type = "response",
+  re_formula = NA
+) |>
+  posterior_draws() |>
+  rename(prob = draw) |>
+  mutate(
+    order_level = factor(
+      as.integer(as.character(group)),
+      levels = 1:K,
+      labels = paste("Order", 1:K)
+    )
+  )
+
+ord_prob_plot <- ggplot(ord_prob_draws, aes(x = order_level, y = prob, colour = treatment, fill = treatment)) +
+  stat_halfeye(.width = 0.95, alpha = 0.7, width = 0.4, position = position_dodgenudge(width = 0.75, x = 0.03)) +
+  stat_halfeye(.width = 0.95, fill = NA, position = position_dodgenudge(width = 0.75, x = 0.03)) +
+  facet_wrap(~ information) +
+  scale_colour_manual(values = c(colour_treatment1, colour_treatment2, colour_treatment3)) +
+  scale_fill_manual(values = c(colour_treatment1, colour_treatment2, colour_treatment3)) +
+  scale_y_continuous(limits = c(0, 1), labels = scales::label_percent()) +
+  labs(
+    y = "Posterior probability",
+    x = "Source of information",
+    colour = "Amitriptyline\nconcentration",
+    fill = "Amitriptyline\nconcentration"
+  ) +
+  theme_classic()
+
+ord_prob_plot
+```
+
+## 6.2 Latency Difference
+
+The difference in latency to resume moving is computed as the focal fish's latency minus the latency of the fastest demonstrator in the same trial. Positive values indicate the focal fish was slower to recover than all demonstrators. Values at or below zero — where the focal fish recovered first or simultaneously — are collapsed to zero and modelled via a hurdle component as this is a separate process as to whether they follow social safety signals at all or not.
+
+```{r}
+ordinal_df <- ordinal_df |>
+  mutate(latency_diff = latency_to_moving - pmin(latency_to_moving_ind2, latency_to_moving_ind3, latency_to_moving_ind4, na.rm = TRUE)) |>
+  mutate(latency_diff_hurdle = ifelse(latency_diff < 0, 0, latency_diff))
+
+hist(ordinal_df$latency_diff)
+```
+
+### 6.2.1 Model Formula
+
+A hurdle log-normal model is used, with separate linear predictors for the hurdle probability (whether the focal fish recovered before all demonstrators) and the continuous component (the magnitude of the lag when positive). Both sub-models include information × treatment, body weight, and the full random effects structure.
+
+```{r}
+latency_diff_formula_hurdle <- bf(
+  latency_diff_hurdle ~ 1 + information * treatment + scale(weight) + (1 | day/trial) + (1 | demonstrator_id),
+  hu ~ 1 + information * treatment + scale(weight) + (1 | day/trial) + (1 | demonstrator_id),
+  family = hurdle_lognormal()
+)
+
+latency_diff_formula_gaussian <- bf(
+  latency_diff ~ 1 + information * treatment + scale(weight) + (1 | day/trial) + (1 | demonstrator_id),
+  family = gaussian())
+```
+
+### 6.2.2 Fit Model
+
+```{r}
+latency_diff_model_hurdle <- brm(latency_diff_formula_hurdle, 
+  data = ordinal_df,
+  control = list(adapt_delta = 0.95, max_treedepth = 12), 
+  iter = 6000, warmup = 4000, 
+  threads = threading(2),
+  chains = 4, cores = 4,
+  backend = 'cmdstanr',
+  file =  "./2-data/4-models/latency_diff_model_hurdle",
+  seed = 9)
+
+latency_diff_model_gaussian <- brm(latency_diff_formula_gaussian, 
+  data = ordinal_df,
+  control = list(adapt_delta = 0.95, max_treedepth = 12), 
+  iter = 6000, warmup = 4000, 
+  threads = threading(2),
+  chains = 4, cores = 4,
+  backend = 'cmdstanr',
+  file =  "./2-data/4-models/latency_diff_model_gaussian",
+  seed = 9)
+```
+
+
+### 6.2.3 Model Diagnostics
+
+The model is validated by checking MCMC chain convergence, comparing priors to posteriors, and running posterior predictive checks.
+
+```{r}
+run_model_diagnostics(latency_diff_model_hurdle)
+run_model_diagnostics(latency_diff_model_gaussian)
+```
+
+### 6.2.4 Effects
+
+*Model summary*
+
+```{r}
+latency_diff_model <- latency_diff_model_gaussian
+
+summary(latency_diff_model)
+bayes_R2(latency_diff_model)
+loo_R2(latency_diff_model)
+```
+
+*Focal predictors*
+
+**Average marginal estimate**
+
+```{r}
+# Average marginal means 
+latency_diff_marginalmeans <- avg_predictions(
+  latency_diff_model,
+  variables = c("information", "treatment"),
+  type = "response",
+  re_formula = NA)
+latency_diff_marginalmeans
+
+#contrasts
+latency_diff_contrasts_information <- avg_comparisons(
+  latency_diff_model,
+  variables = list(information = "pairwise"),
+  type = "response",
+  re_formula = NA) |> 
+  add_pd()
+latency_diff_contrasts_information
+
+latency_diff_contrasts_treatment <- avg_comparisons(
+  latency_diff_model,
+  variables = list(treatment = "pairwise"),
+  by = "information", 
+  type = "response",
+  re_formula = NA) |> 
+  add_pd()
+latency_diff_contrasts_treatment
+```
+
+*Covariate effects*
+
+```{r}
+latency_diff_covariate <- avg_slopes(latency_diff_model, variables = "weight", re_formula = NA, type = "response") |> add_pd()
+latency_diff_covariate
+```
+
+
+### 6.2.5 Figures
+
+*Treatment × information effects plot*
+
+```{r}
+latency_diff_marginalmeans_draws <- latency_diff_marginalmeans |>
+  get_draws() |> 
+  rename(latency_diff = draw)
+
+
+latency_diff_plot <- ggplot(data = ordinal_df, aes(x = information, y = latency_diff, colour = treatment, fill = treatment)) +
+  geom_hline(yintercept = 0, colour = "grey50", linetype = "dashed") +
+  geom_boxplot(alpha = 0.2, width = 0.2, position = pos_box) +
+  stat_halfeye(
+    data = latency_diff_marginalmeans_draws,
+    .width = 0.95,
+    slab_alpha = 0.7,
+    position = pos_eye,
+    width = 0.3
+  ) +
+  scale_colour_manual(
+    aesthetics = c("colour", "fill"),
+    values = c(colour_treatment1, colour_treatment2, colour_treatment3),
+    labels = c("Unexposed", "Low", "High")
+  ) +
+  scale_x_discrete(labels = c("Combined\ninformation", "Social\ninformation")) +
+  labs(
+    y = "Difference in latency to\nresume moving (min)",
+    x = "Source of information",
+    colour = "Amitriptyline\nconcentration",
+    fill = "Amitriptyline\nconcentration"
+  ) +
+  theme_classic(base_size = 12) +
+  coord_cartesian(ylim = c(-23, 90))
+
+latency_diff_plot
+```
+
+# 7. Figures
+
+## 7.1 Treatment × Information Plots
+
+The individual treatment × information effect plots produced in Sections 4 and 6 are displayed and combined here into the four-panel composite used as Figure 2 in the manuscript. Two versions are generated: a quick prototype using boxplots with posterior half-eye overlays, and a publication-ready version with jittered raw data and diamond-shaped group means.
+
+```{r}
+recovery_time_plot
+latency_to_moving_plot
+ord_expected_plot
+latency_diff_plot
+```
+
+
+```{r, fig.width=7.5, fig.height=5}
+latency_plot <- (recovery_time_plot +
+  scale_y_continuous(breaks = seq(0, 250, by = 30)) +
+  coord_cartesian(ylim = c(0, 170)) +
+  labs(y = "Latency to fully recover\n(min)") +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_blank(),
+        axis.title.y = element_text(size = 12),
+        axis.text.y = element_text(size = 10),
+        axis.line = element_blank(),
+        legend.position = c(0.5, 0.91),
+        legend.title = element_blank(),
+        legend.direction = "horizontal",
+        legend.key.size = unit(0.4, "cm"),
+        legend.text = element_text(size = 12),
+        panel.border = element_rect(colour = "black", fill = NA, linewidth = 1.1))) /
+(latency_to_moving_plot +
+  scale_y_continuous(breaks = seq(0, 250, by = 30)) +
+  coord_cartesian(ylim = c(0, 90)) +
+  labs(y = "Latency to resume\nmoving (min)") +
+  theme(#legend.position = c(0.72, 0.98),
+        # legend.title = element_blank(),
+        # legend.direction = "horizontal",
+        # legend.key.size = unit(0.4, "cm"),
+        # legend.text = element_text(size = 10),
+    axis.line = element_blank(),
+    legend.position = "none",
+        axis.text.x = element_text(size = 12),
+        axis.title.y = element_text(size = 12),
+        axis.text.y = element_text(size = 10),
+        axis.title.x = element_blank(),
+        panel.border = element_rect(colour = "black", fill = NA, linewidth = 1.1)))
+
+correlation2_plot <- (ord_expected_plot +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_blank(),
+        axis.line = element_blank(),
+        axis.title.y = element_text(size = 12),
+        axis.text.y = element_text(size = 10),
+        legend.position = "none",
+        panel.border = element_rect(colour = "black", fill = NA, linewidth = 1.1))) /
+(latency_diff_plot +
+  scale_y_continuous(breaks = seq(-20, 90, by = 20)) +
+  coord_cartesian(ylim = c(-23, 90)) +
+  labs(y = "Difference in latency to\nresume moving (min)") +
+   theme(
+     legend.position = "none",
+        axis.line = element_blank(),
+        axis.text.x = element_text(size = 12),
+        axis.text.y = element_text(size = 10),
+        axis.title.y = element_text(size = 12),
+        axis.title.x = element_blank(),
+        panel.border = element_rect(colour = "black", fill = NA, linewidth = 1.1)))
+
+four_panel <- latency_plot | correlation2_plot
+
+four_panel
+```
+
+
+```{r}
+ggsave("./3-figs/figure2.png", plot = four_panel, width = 7.5, height = 5, dpi = 300)
+```
+
+## 7.2 Temporal Plots
+
+Temporal activity data are loaded and filtered to the control treatment only to provide a clean behavioural illustration unconfounded by amitriptyline effects. A single-trial example track is plotted to illustrate how latency to resume moving and recovery time are defined relative to cue administration. This is combined with a population-level temporal profile showing mean activity over time by information condition. These plots, together with the amitriptyline concentration plot and the experimental design schematic, are assembled into Figure 1.
+
+```{r}
+global_temporal_df <- read_csv("./2-data/temporal_data.csv") |> 
+  filter(trial_time <= 90) |>
+  left_join(treatment_key, by = c("treatment" = "blinded")) |>
+  rename(treatment_blinded = treatment, treatment = original) |>
+  left_join(information_key, by = c("information" = "blinded")) |>
+  rename(information_blinded = information, information = original) |> 
+  filter(treatment == "c")
+
+trial_example <- "d4-t2-TZ1-t-4TZ2-i"
+baseline_example <- "d4-t2-TZ1-b-4TZ2-i"
+
+example_temporal_plot_df <- global_temporal_df |> 
+  filter(session_name %in% c(trial_example, baseline_example)) |>
+  mutate(trial_time = ifelse(phase == "baseline", trial_time - 20, trial_time),
+         SD = filter(mean_df, session_name == trial_example)$baseline_prop_moving_sd,
+         mean_val = filter(mean_df, session_name == trial_example)$baseline_prop_moving_mean,
+         move = filter(mean_df, session_name == trial_example)$latency_to_moving,
+         recover = filter(mean_df, session_name == trial_example)$recovery_time,
+         vel_mean = filter(mean_df, session_name == trial_example)$baseline_velocity_mean,
+         vel_sd = filter(mean_df, session_name == trial_example)$baseline_velocity_sd)
+
+global_temporal_plot_df <- global_temporal_df |> 
+  group_by(information, phase, trial_time) |> 
+  summarise(mean_velocity = mean(velocity_cm_s),
+            mean_behavioural_state = mean(prop_moving_instant)) |> 
+  mutate(trial_time = ifelse(phase == "baseline", trial_time - 20, trial_time))
+```
+
+*Single example track*
+
+```{r example_temporal_moving_plot, fig.width=10, fig.height=4}
+example_temporal_moving_plot <- ggplot(example_temporal_plot_df, aes(x = trial_time, y = prop_moving_sliding)) +
+  geom_hline(yintercept = 0.5, linetype = "dotted", colour = "gray50", linewidth = 0.3) +
+  annotate("text", x = 0.08, y = 0.12, label = "Cue added", hjust = -0.07, fontface = "bold",  size = 4, colour = "red") +
+  annotate("text", x = (first(example_temporal_plot_df$move)-0.33), y = 0.12, label = "Latency to move", hjust = -0.07, fontface = "bold", size = 4, colour = colour_latency_to_move) +
+  annotate("text", x = (first(example_temporal_plot_df$recover)-0.33), y = 0.12, label = "Time to recover", hjust = -0.07,  fontface = "bold", size = 4 , colour = colour_time_to_recover) +
+  annotate("rect", xmin = -20, xmax = 90, ymin = first(example_temporal_plot_df$mean_val - example_temporal_plot_df$SD), ymax = 1, fill = colour_information1_light1, alpha = 0.2) +
+  geom_hline(yintercept = example_temporal_plot_df$mean_val, linetype = "dashed", colour = colour_information1_light1, linewidth = 0.5, alpha = 1) +
+  geom_vline(xintercept = example_temporal_plot_df$move, linetype = "solid", colour = colour_latency_to_move, linewidth = 1.1) +
+  geom_vline(xintercept = example_temporal_plot_df$recover, linetype = "solid", colour = colour_time_to_recover, linewidth = 1.1) +
+  geom_line(aes(colour = phase), linewidth = 1.2) +
+  geom_vline(xintercept = 0, linetype = "solid", colour = "red", linewidth = 1.1) +
+  scale_colour_manual(values = c("baseline" = colour_information1_light2, "trial" = colour_information1)) +
+  scale_y_continuous(limits = c(0, 1.03), breaks = seq(0, 1, 0.5)) +
+  labs(
+    x = "Time relative to cue administration (min)",
+    y = "Proportion of\ntime moving",
+    colour = NULL) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "none",
+      axis.line = element_blank(),
+      axis.text.x = element_text(size = 10),
+      axis.title.x = element_blank(),
+      panel.background = element_rect(fill = NA),
+      panel.border = element_rect(colour = "black", fill = NA, linewidth = 1.1)) +
+  coord_cartesian(xlim = c(-8.33, 36.67))
+
+example_temporal_moving_plot
+```
+
+```{r example_temporal_vel_plot, fig.width=10, fig.height=4}
+example_temporal_vel_plot <- ggplot(example_temporal_plot_df, aes(x = trial_time, y = velocity_cm_s)) +
+  annotate("rect", xmin = -20, xmax = 90, ymin = first(example_temporal_plot_df$vel_mean - example_temporal_plot_df$vel_sd), ymax = first(example_temporal_plot_df$vel_mean + example_temporal_plot_df$vel_sd), fill = colour_information1_light1, alpha = 0.2) +
+  geom_hline(yintercept = example_temporal_plot_df$vel_mean, linetype = "dashed", colour = colour_information1_light1, linewidth = 0.5, alpha = 1) +
+  geom_vline(xintercept = example_temporal_plot_df$recover, linetype = "solid", colour = colour_time_to_recover, linewidth = 1.1) +
+  geom_line(aes(colour = phase), linewidth = 0.8) +
+  geom_vline(xintercept = 0, linetype = "solid", colour = "red", linewidth = 1.1) +
+  scale_colour_manual(values = c("baseline" = colour_information1_light2, "trial" = colour_information1)) +
+  scale_y_continuous(limits = c(0, 10), breaks = seq(0, 10, 5)) +
+  labs(
+    x = "Time relative to cue administration (min)",
+    y = "Velocity (cm/s)",
+    colour = NULL) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "none",
+      axis.line = element_blank(),
+      axis.text.x = element_text(size = 10),
+      axis.title.x = element_blank(),
+      panel.background = element_rect(fill = NA),
+      panel.border = element_rect(colour = "black", fill = NA, linewidth = 1.1)) +
+  coord_cartesian(xlim = c(-8.33, 36.67))
+
+example_temporal_vel_plot
+```
+
+```{r, fig.width=7, fig.height=4}
+p_top <- example_temporal_moving_plot 
+
+p_bot <- example_temporal_vel_plot
+
+combined_temporal_plot <- (p_top / p_bot)
+
+combined_temporal_plot 
+```
+
+*Global temporal plot (control group)*
+```{r global_temporal_plot, fig.width=7, fig.height=5}
+global_temporal_plot <- ggplot(data = global_temporal_plot_df, aes(x = trial_time, y = mean_behavioural_state)) +
+  geom_hline(yintercept = 0.5, linetype = "dotted", colour = "gray50", linewidth = 0.3) +
+  #geom_smooth(method = "gam", aes(colour = interaction(information, phase), group = interaction(information, phase)))+
+  geom_line(aes(colour = interaction(information, phase), group = interaction(information, phase)), alpha = 0.8) +
+  geom_vline(xintercept = 0, linetype = "solid", colour = "red", linewidth = 1.1) +
+  scale_y_continuous(limits = c(0, 1), breaks = seq(0, 1, 0.5)) +
+  scale_x_continuous(limits = c(-20, 90)) +
+  scale_colour_manual(
+    values = c(
+      "personal.trial" = colour_information2,
+      "social.trial" = colour_information1,
+      "personal.baseline" = colour_information2_light2,
+      "social.baseline" = colour_information1_light2
+    ),
+    breaks = c("personal.trial", "social.trial"), 
+    labels = c("Combined", "Social")             
+  ) +
+  labs(
+    x = "Time relative to cue administration (min)",
+    y = "Proportion of\ntime moving",
+    colour = NULL
+  ) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = c(0.9, 0.165),
+        legend.background = element_blank(),
+        legend.key.spacing.y = unit(-6, "pt"),
+      axis.line = element_blank(),
+      axis.text.x = element_text(size = 10),
+      panel.background = element_rect(fill = NA),
+      panel.border = element_rect(colour = "black", fill = NA, linewidth = 1.1)) +
+  coord_cartesian(xlim = c(-8.33, 36.67))
+
+global_temporal_plot
+```
+
+```{r, fig.width=6, fig.height=5}
+final_plot <- (combined_temporal_plot / global_temporal_plot) 
+final_plot
+```
+
+```{r, fig.width=10, fig.height=6}
+ggsave("./3-figs/figure1.png", final_plot, width = 6, height = 5, dpi = 300)
+```
+
+
+# 8. Supplementary Tables
+
+## 8.1 Individual Outcome Tables
+
+The following chunk formats and displays the marginal means, pairwise contrasts, and covariate effects for each response variable separately. For the ordinal outcome (order to resume moving), contrasts are computed directly from posterior draws on the expected-order scale, since `avg_comparisons` operates on the log-odds scale for cumulative models.
+
+```{r}
+#Time taken to recover
+as.data.frame(recovery_time_marginalmeans) |> 
+  rename('Recovery time (min) estimate' = estimate,
+         'Lower 95% credible interval' = conf.low,
+         'Upper 95% credible interval' = conf.high,
+         Informtaion = information,
+         Treatment = treatment
+         ) |> 
+  select(-df) |> 
+  mutate(across(where(is.numeric), \(x) round(x, 2)))
+
+## Information contrasts
+recovery_time_contrasts_information |> 
+  rename('Estimated difference in recovery time (min)' = estimate,
+         'Lower 95% credible interval' = conf.low,
+         'Upper 95% credible interval' = conf.high,
+         Contrast = contrast,
+         "Probability of direciton" = pd) |> 
+  select(-term)|> 
+  mutate(across(where(is.numeric), \(x) round(x, 2)))
+
+##treatment contrasts
+recovery_time_contrasts_treatment |> 
+  rename('Estimated difference in recovery time (min)' = estimate,
+         'Lower 95% credible interval' = conf.low,
+         'Upper 95% credible interval' = conf.high,
+         'Treatment contrast' = contrast,
+         Information = information,
+         "Probability of direciton" = pd) |> 
+  select(-term)|> 
+  mutate(across(where(is.numeric), \(x) round(x, 2)))
+
+## covariate estimates
+recovery_time_covariate |> 
+  rename('Estimated change in recovey time (min)' = estimate,
+         'Lower 95% credible interval' = conf.low,
+         'Upper 95% credible interval' = conf.high,
+         "Probability of direciton" = pd,
+          'Trend term' = term) |> 
+  select(-c(contrast))
+
+# ============================================================================
+# LATENCY TO MOVING
+# ============================================================================
+
+# Marginal means
+as.data.frame(latency_to_moving_marginalmeans) |> 
+  rename('Latency to moving (min) estimate' = estimate,
+         'Lower 95% credible interval' = conf.low,
+         'Upper 95% credible interval' = conf.high,
+         Information = information,
+         Treatment = treatment) |> 
+  select(-df) |> 
+  mutate(across(where(is.numeric), \(x) round(x, 2)))
+
+## Information contrasts
+latency_to_moving_contrasts_information |> 
+  rename('Estimated difference in latency (min)' = estimate,
+         'Lower 95% credible interval' = conf.low,
+         'Upper 95% credible interval' = conf.high,
+         Contrast = contrast,
+         "Probability of direction" = pd) |> 
+  select(-term) |> 
+  mutate(across(where(is.numeric), \(x) round(x, 2)))
+
+## Treatment contrasts
+latency_to_moving_contrasts_treatment |> 
+  rename('Estimated difference in latency (min)' = estimate,
+         'Lower 95% credible interval' = conf.low,
+         'Upper 95% credible interval' = conf.high,
+         'Treatment contrast' = contrast,
+         Information = information,
+         "Probability of direction" = pd) |> 
+  select(-term) |> 
+  mutate(across(where(is.numeric), \(x) round(x, 2)))
+
+## Covariate estimates
+latency_to_moving_covariate |> 
+  rename('Estimated change in latency (min)' = estimate,
+         'Lower 95% credible interval' = conf.low,
+         'Upper 95% credible interval' = conf.high,
+         "Probability of direction" = pd,
+         'Trend term' = term) |> 
+  select(-contrast) |> 
+  mutate(across(where(is.numeric), \(x) round(x, 2)))
+
+# ============================================================================
+# ORDER TO RESUME MOVING
+# ============================================================================
+
+# Marginal means (expected-order scale)
+order_to_resume_moving_marginalmeans_single |>
+  rename('Expected order estimate' = estimate,
+         'Lower 95% credible interval' = conf.low,
+         'Upper 95% credible interval' = conf.high,
+         Information = information,
+         Treatment = treatment,
+         "Probability of direction" = pd) |>
+  mutate(across(where(is.numeric), \(x) round(x, 2)))
+
+## Information contrasts
+order_to_resume_moving_contrasts_information_single |>
+  rename('Estimated difference in expected order' = estimate,
+         'Lower 95% credible interval' = conf.low,
+         'Upper 95% credible interval' = conf.high,
+         Contrast = information,
+         "Probability of direction" = pd) |>
+  mutate(across(where(is.numeric), \(x) round(x, 2)))
+
+## Treatment contrasts
+order_to_resume_moving_contrasts_treatment_single |>
+  rename('Estimated difference in expected order' = estimate,
+         'Lower 95% credible interval' = conf.low,
+         'Upper 95% credible interval' = conf.high,
+         'Treatment contrast' = treatment,
+         Information = information,
+         "Probability of direction" = pd) |>
+  mutate(across(where(is.numeric), \(x) round(x, 2)))
+
+## Covariate (weight) effect
+order_to_resume_moving_covariate_single |>
+  mutate(`Trend term` = "weight") |>
+  rename('Estimated change in expected order per unit weight' = estimate,
+         'Lower 95% credible interval' = conf.low,
+         'Upper 95% credible interval' = conf.high,
+         "Probability of direction" = pd) |>
+  select(`Trend term`, everything()) |>
+  mutate(across(where(is.numeric), \(x) round(x, 2)))
+
+# ============================================================================
+# LATENCY DIFFERENCE (demonstrators - focal)
+# ============================================================================
+
+# Marginal means
+as.data.frame(latency_diff_marginalmeans) |> 
+  rename('Latency difference (min) estimate' = estimate,
+         'Lower 95% credible interval' = conf.low,
+         'Upper 95% credible interval' = conf.high,
+         Information = information,
+         Treatment = treatment) |> 
+  select(-df) |> 
+  mutate(across(where(is.numeric), \(x) round(x, 2)))
+
+## Information contrasts
+latency_diff_contrasts_information |>
+  rename('Estimated difference in latency diff (min)' = estimate,
+         'Lower 95% credible interval' = conf.low,
+         'Upper 95% credible interval' = conf.high,
+         Contrast = contrast,
+         "Probability of direction" = pd) |> 
+  select(-term) |> 
+  mutate(across(where(is.numeric), \(x) round(x, 2)))
+
+## Treatment contrasts
+latency_diff_contrasts_treatment |> 
+  rename('Estimated difference in latency diff (min)' = estimate,
+         'Lower 95% credible interval' = conf.low,
+         'Upper 95% credible interval' = conf.high,
+         'Treatment contrast' = contrast,
+         Information = information,
+         "Probability of direction" = pd) |> 
+  select(-term) |> 
+  mutate(across(where(is.numeric), \(x) round(x, 2)))
+
+## Covariate estimates (weight)
+latency_diff_covariate |> 
+  rename('Estimated change in latency diff (min)' = estimate,
+         'Lower 95% credible interval' = conf.low,
+         'Upper 95% credible interval' = conf.high,
+         "Probability of direction" = pd,
+         'Trend term' = term) |> 
+  select(-contrast) |> 
+  mutate(across(where(is.numeric), \(x) round(x, 2)))
+```
+
+## 8.2 Combined Summary Tables
+
+The four chunks below pool estimates across all response variables into the tables used as Tables S1–S4 in the manuscript.
+
+### Table S1: Marginal Means
+
+```{r}
+estimated_means <- bind_rows(
+  as.data.frame(recovery_time_marginalmeans) |>
+    select(information, treatment, estimate, conf.low, conf.high) |>
+    mutate(Response = "Recovery time (min)"),
+  as.data.frame(latency_to_moving_marginalmeans) |>
+    select(information, treatment, estimate, conf.low, conf.high) |>
+    mutate(Response = "Latency to moving (min)"),
+  order_to_resume_moving_marginalmeans_single |>
+    select(information, treatment, estimate, conf.low, conf.high) |>
+    mutate(Response = "Order to resume moving"),
+  as.data.frame(latency_diff_marginalmeans) |>
+    select(information, treatment, estimate, conf.low, conf.high) |>
+    mutate(Response = "Latency difference (min)")
+) |>
+  mutate(across(where(is.numeric), \(x) round(x, 2))) |>
+  select(Response,
+         Information = information,
+         Treatment = treatment,
+         Estimate = estimate,
+         `Lower 95% CrI` = conf.low,
+         `Upper 95% CrI` = conf.high)
+
+estimated_means
+```
+
+### Table S2: Information Contrasts
+
+```{r}
+information_contrasts <- bind_rows(
+  as.data.frame(recovery_time_contrasts_information) |>
+    select(contrast, estimate, conf.low, conf.high, pd) |>
+    mutate(Response = "Recovery time (min)"),
+  as.data.frame(latency_to_moving_contrasts_information) |>
+    select(contrast, estimate, conf.low, conf.high, pd) |>
+    mutate(Response = "Latency to moving (min)"),
+  order_to_resume_moving_contrasts_information_single |>
+    rename(contrast = information) |>
+    select(contrast, estimate, conf.low, conf.high, pd) |>
+    mutate(Response = "Order to resume moving"),
+  as.data.frame(latency_diff_contrasts_information) |>
+    select(contrast, estimate, conf.low, conf.high, pd) |>
+    mutate(Response = "Latency difference (min)")
+) |>
+  mutate(across(where(is.numeric), \(x) round(x, 2))) |>
+  select(Response,
+         Contrast = contrast,
+         Estimate = estimate,
+         `Lower 95% CrI` = conf.low,
+         `Upper 95% CrI` = conf.high,
+         `Probability of Direction` = pd)
+
+information_contrasts
+```
+
+### Table S3: Treatment Contrasts by Information Source
+
+```{r}
+treatment_contrasts <- bind_rows(
+  as.data.frame(recovery_time_contrasts_treatment) |>
+    select(information, contrast, estimate, conf.low, conf.high, pd) |>
+    mutate(Response = "Recovery time (min)"),
+  as.data.frame(latency_to_moving_contrasts_treatment) |>
+    select(information, contrast, estimate, conf.low, conf.high, pd) |>
+    mutate(Response = "Latency to moving (min)"),
+  order_to_resume_moving_contrasts_treatment_single |>
+    rename(contrast = treatment) |>
+    select(information, contrast, estimate, conf.low, conf.high, pd) |>
+    mutate(Response = "Order to resume moving"),
+  as.data.frame(latency_diff_contrasts_treatment) |>
+    select(information, contrast, estimate, conf.low, conf.high, pd) |>
+    mutate(Response = "Latency difference (min)")
+) |>
+  mutate(across(where(is.numeric), \(x) round(x, 2))) |>
+  select(Response,
+         Information = information,
+         `Treatment Contrast` = contrast,
+         Estimate = estimate,
+         `Lower 95% CrI` = conf.low,
+         `Upper 95% CrI` = conf.high,
+         `Probability of Direction` = pd)
+
+treatment_contrasts
+```
+
+### Table S4: Weight Covariate Effects
+
+```{r}
+weight_effects <- bind_rows(
+  as.data.frame(recovery_time_covariate) |>
+    select(estimate, conf.low, conf.high, pd) |>
+    mutate(Response = "Recovery time (min)"),
+  as.data.frame(latency_to_moving_covariate) |>
+    select(estimate, conf.low, conf.high, pd) |>
+    mutate(Response = "Latency to moving (min)"),
+  order_to_resume_moving_covariate_single |>
+    select(estimate, conf.low, conf.high, pd) |>
+    mutate(Response = "Order to resume moving"),
+  as.data.frame(latency_diff_covariate) |>
+    select(estimate, conf.low, conf.high, pd) |>
+    mutate(Response = "Latency difference (min)")
+) |>
+  mutate(across(where(is.numeric), \(x) round(x, 2))) |>
+  select(Response,
+         Estimate = estimate,
+         `Lower 95% CrI` = conf.low,
+         `Upper 95% CrI` = conf.high,
+         `Probability of Direction` = pd)
+
+weight_effects
+```
+
+## 8.3 Export to Word
+
+Tables S1–S4 are formatted in Times New Roman with APA-style borders (lines above and below the header, and below the last row) and exported to a single Word document. The `make_ft()` helper applies consistent formatting, and `make_caption()` renders the table number in bold followed by the descriptive caption in regular weight.
+
+```{r}
+fmt_2dp <- function(x) {
+  out <- formatC(x, format = "f", digits = 2)
+  gsub("-", "\u2212", out)
+}
+
+make_ft <- function(df) {
+  df <- df |>
+    mutate(across(where(is.character), \(x) gsub(" - ", " \u2013 ", x)))
+  
+  num_cols <- names(df)[vapply(df, is.numeric, logical(1))]
+  fmt_list <- setNames(rep(list(fmt_2dp), length(num_cols)), num_cols)
+  
+  ft <- flextable(df) |>
+    theme_vanilla() |>
+    fontsize(size = 11, part = "all") |>
+    font(fontname = "Times New Roman", part = "all") |>
+    border_remove() |>
+    border(part = "header", border.top = fp_border(), border.bottom = fp_border()) |>
+    border(part = "body", i = nrow(df), border.bottom = fp_border())
+  
+  if (length(fmt_list)) {
+    ft <- do.call(set_formatter, c(list(x = ft), fmt_list))
+  }
+  
+  ft |> autofit()
+}
+
+make_caption <- function(full_sentence) {
+  title <- sub("^([^.]*)\\..*$", "\\1.", full_sentence)
+  rest <- sub("^[^.]*\\.\\s*(.*)$", "\\1", full_sentence)
+  if (identical(rest, full_sentence)) rest <- ""
+  fpar(
+    ftext(title, fp_text(bold = TRUE, font.size = 11, font.family = "Times New Roman")),
+    ftext(ifelse(nchar(rest) > 0, paste0(" ", rest), ""),
+          fp_text(font.size = 11, font.family = "Times New Roman"))
+  )
+}
+
+tables <- list(
+  list(
+    caption = "Table S1. Posterior marginal mean estimates by information source and amitriptyline treatment, with 95% credible intervals (CrI).",
+    table = estimated_means
+  ),
+  list(
+    caption = "Table S2. Pairwise contrasts between information sources (social - personal), with 95% credible intervals (CrI) and probability of direction (pd).",
+    table = information_contrasts
+  ),
+  list(
+    caption = "Table S3. Pairwise contrasts between amitriptyline treatments within each information source, with 95% credible intervals (CrI) and probability of direction (pd).",
+    table = treatment_contrasts
+  ),
+  list(
+    caption = "Table S4. Marginal effects of body weight on each response variable, with 95% credible intervals (CrI) and probability of direction (pd).",
+    table = weight_effects
+  )
+)
+
+
+doc <- read_docx()
+for (tbl in tables) {
+  doc <- body_add_fpar(doc, make_caption(tbl$caption))
+  ft <- make_ft(tbl$table)
+  doc <- body_add_flextable(doc, ft)
+  doc <- body_add_par(doc, "")
+}
+
+print(doc, target = "./3-figs/Supplementary_Tables.docx")
+```

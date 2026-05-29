@@ -1,0 +1,2026 @@
+---
+title: "fear-contagion-ami_data-wrangling"
+author: "Jack L Manera"
+format: html
+---
+
+
+# 1. Setup environment
+
+*Install & Load Required Packages*
+```{r packages}
+#If 'pacman' is not already installed please un-hash and run the line below
+#install.packages("pacman")
+#remotes::install_github("JLManera/cleanRfish")
+
+# Core packages for manipulation and plotting
+pacman::p_load(tidyverse, ggplot2, zoo, readxl, cleanRfish, stringr, moveHMM, patchwork, future, furrr, sf, changepoint, install = TRUE, update = TRUE)
+```
+
+# 2. Clean raw tracks
+
+## 2.1 Locate trajectory files
+
+Traverse the idtracker.ai output folder structure and recursively find all trajectories.csv files (i.e., raw tracks).
+
+```{r paths, message=FALSE, error=FALSE}
+idtracker_raw_output_directory <- "./2-data/1-raw_tracks"
+
+csv_files <- list.files(
+  path = idtracker_raw_output_directory,
+  pattern = "trajectories\\.csv$",
+  recursive = TRUE,
+  full.names = TRUE
+) |>
+  (\(x) x[!grepl("pretrained", x)])() #removing data from the pretrained model (this was used as a starting set of weights for the tracking model)
+
+# focal tracks
+focal_csvs <- csv_files |> 
+  keep(~ str_detect(.x, regex("focal", ignore_case = TRUE)))
+
+# demonstrator tracks
+demonstrators_csvs <- csv_files |> 
+  keep(~ str_detect(.x, regex("demonstrator", ignore_case = TRUE)))
+```
+
+
+## 2.2 Read in assisting dataframes
+
+This reads in both calibration data needed to convert pixels to cm's and infomrmation regarding track reconstruction.
+```{r calibration}
+#this is a csv that indicates whether track reconstruction was better of worse than the raw track itself and thus is used to decide whether a track is reconstructed or not.
+reconstruct_or_not_df <- read_csv("./2-data/video_validation.csv") |>
+  mutate(session = str_remove(Video, "\\..*$"))
+
+#this is the video pixel calibration to convert pixels to cms
+distance_calibration_df <- read_csv("./2-data/pixel_distances.csv") |> 
+  select(c(id, distance_px)) |>
+  mutate(
+    day_trial_camera = str_extract(id, "^d\\d+-t\\d+-c\\d+")
+  )
+
+# Calculate average pixels per day-trial-camera grouping
+group_avg_pixels <- distance_calibration_df |>
+  group_by(day_trial_camera) |>
+  summarize(
+    avg_distance_px = mean(distance_px, na.rm = TRUE),
+    n_measurements = n(),
+    .groups = "drop"
+  ) |>
+  mutate(pixels_per_cm = avg_distance_px / 45,
+         cam = substr(day_trial_camera, 7, 10)) 
+
+  
+ggplot(group_avg_pixels, aes(x = pixels_per_cm)) +
+  geom_histogram(bins = 30) +
+  labs(title = "Calibration Distribution (averaged per day-trial-camera)", 
+       x = "Pixels per cm", y = "Count") +
+  facet_wrap(~cam)
+```
+
+## 2.3 Metadata extraction
+
+```{r}
+extract_meta_information <- function(path) {
+  # Extract the session folder name
+  session_name <- stringr::str_extract(path, "session_[^/]+") |>
+    stringr::str_remove("^session_")
+
+  # Extract day, trial, camera numbers
+  day <- stringr::str_match(session_name, "d(\\d+)")[, 2]
+  trial <- stringr::str_match(session_name, "t(\\d+)")[, 2]
+  camera <- stringr::str_match(session_name, "c(\\d+)")[, 2]
+
+  # Phase: baseline if contains "-b-", else trial if contains "-t-"
+  phase <- case_when(
+    stringr::str_detect(session_name, "-b-") ~ "baseline",
+    stringr::str_detect(session_name, "-t-") ~ "trial",
+    TRUE ~ NA_character_
+  )
+
+  # ID: whatever comes after the last "-b-" or "-t-"
+  ID <- stringr::str_extract(session_name, "(?<=-[bt]-).+$")
+  
+  treatment <- substr(ID, 2, 2)
+  
+  information <- ifelse(substr(ID, 5,5) == "d", "personal", ifelse(substr(ID, 5,5) == "i", "social", "error"))
+
+  tibble::tibble(
+    path = path,
+    session_name = session_name,
+    day = as.integer(day),
+    trial = as.integer(trial),
+    camera = as.integer(camera),
+    phase = phase,
+    ID = ID,
+    treatment = treatment,
+    information = information
+  )
+}
+```
+
+## 2.4 Main processing pipeline
+
+This section loops through every tracked session and performs the core data-processing steps. Uses parallel processing to speed up computation across multiple CPU cores.
+
+```{r process_save_each_trial}
+output_track_dir <- "./2-data/2-smoothed_tracks"
+
+# Set up parallel processing - uses all available cores minus 1
+plan(multisession, workers = max(1, availableCores() - 1))
+
+# Define the processing function for a single session
+process_single_session <- function(csv_file, demonstrators_csvs, group_avg_pixels, reconstruct_or_not_df) {
+  
+  meta_info  <- extract_meta_information(csv_file)
+  session_id <- meta_info$session_name[1]
+  
+  #wrap entire processing in tryCatch to identify if session fails
+  tryCatch({
+    
+    trajectories_df <- readr::read_csv(csv_file, show_col_types = FALSE) |> 
+      rename(x1 = trajectories1,
+             y1 = trajectories2)
+    
+    reconstruct_or_not <- reconstruct_or_not_df |> 
+      filter(session == session_id)
+    
+    # Handle case where reconstruct_or_not is empty (no validation data for this session)
+    if (nrow(reconstruct_or_not) == 0) {
+      warning(sprintf("No validation data found for %s. Using reconstructed tracks by default.", session_id))
+      focal_use_reconstructed <- TRUE
+      dem_use_reconstructed <- TRUE
+    } else {
+      focal_use_reconstructed <- reconstruct_or_not$focal_fixed_with_cleanRfish[1] == "y"
+      dem_use_reconstructed <- reconstruct_or_not$dem_fixed_with_cleanRfish[1] == "y"
+    }
+    
+    demonstrator_csv_file <- demonstrators_csvs[grepl(paste0(sub("-focal$", "-demonstrator", session_id)), demonstrators_csvs)]
+    
+    # Track the number of demonstrators found
+    n_demonstrators <- 0
+    
+    if (length(demonstrator_csv_file) == 1) {
+      demonstrator_df <- readr::read_csv(demonstrator_csv_file, show_col_types = FALSE)
+      
+      # Dynamically rename demonstrator columns based on what exists
+      # The demonstrator file may have 1, 2, or 3 fish (x1/y1, x2/y2, x3/y3)
+      rename_map <- c()
+      if ("x1" %in% names(demonstrator_df)) { rename_map <- c(rename_map, x2 = "x1", y2 = "y1"); n_demonstrators <- n_demonstrators + 1 }
+      if ("x2" %in% names(demonstrator_df)) { rename_map <- c(rename_map, x3 = "x2", y3 = "y2"); n_demonstrators <- n_demonstrators + 1 }
+      if ("x3" %in% names(demonstrator_df)) { rename_map <- c(rename_map, x4 = "x3", y4 = "y3"); n_demonstrators <- n_demonstrators + 1 }
+      
+      if (length(rename_map) > 0) {
+        demonstrator_df <- demonstrator_df |> rename(!!!rename_map)
+      }
+      
+      # Combine focal and demonstrator data
+      trajectories_df <- merge(trajectories_df, demonstrator_df, by = "time")
+      } else {
+      warning(sprintf("No matching demonstrator file found for %s.", session_id))
+    }
+    
+    #trim the baseline recordings so that they are all of equal length
+    if(stringr::str_detect(session_id, "-b-")) {
+      trajectories_df <- trajectories_df |> 
+        filter(time >= 300 & time <= 1500) |> 
+        mutate(time = time - 300)
+      }
+    
+    #reconstruct using cleanRfish
+    reconstructed_path <- tryCatch(
+      cleanRfish::clean_track(
+        trajectories_df,
+        z_thresh = 5,
+        window = 20,
+        speed_threshold_quantile = 1,
+        smooth_method = "savitzky_golay",
+        min_movement = 500,
+        diagnostic_plots = FALSE,
+        min_candidates = 5
+      ),
+      error = function(e) {
+        warning(sprintf(
+          "Trajectory reconstruction failed for %s: %s\n.",
+          session_id,
+          e$message
+        ))
+        return(list(tracks = trajectories_df, error = TRUE))
+      }
+    )
+    
+    # Update the tracks dataframe: remove existing x_smooth/y_smooth and recreate based on validation
+    reconstructed_path$tracks <- reconstructed_path$tracks |>
+      mutate(
+        # For focal individual (individual_number == 1):
+        # If reconstruction was NOT helpful ("n"), use original; otherwise use reconstructed
+        x_smooth = case_when(
+          individual_number == 1 & !focal_use_reconstructed ~ x_original,
+          individual_number == 1 & focal_use_reconstructed ~ x_reconstructed,
+          # For demonstrator individuals (2, 3, 4):
+          individual_number %in% c(2, 3, 4) & !dem_use_reconstructed ~ x_original,
+          individual_number %in% c(2, 3, 4) & dem_use_reconstructed ~ x_reconstructed,
+          TRUE ~ x_smooth
+        ),
+        y_smooth = case_when(
+          individual_number == 1 & !focal_use_reconstructed ~ y_original,
+          individual_number == 1 & focal_use_reconstructed ~ y_reconstructed,
+          individual_number %in% c(2, 3, 4) & !dem_use_reconstructed ~ y_original,
+          individual_number %in% c(2, 3, 4) & dem_use_reconstructed ~ y_reconstructed,
+          TRUE ~ y_smooth
+        )
+      ) |> 
+      group_by(individual_number) |> 
+      arrange(time) |> 
+      mutate(x_filled = zoo::na.approx(x_smooth, na.rm = FALSE),
+             y_filled = zoo::na.approx(y_smooth, na.rm = FALSE)) |>
+      ungroup()
+  
+  # Helper function to apply sgolayfilt 
+  safe_sgolay <- function(x, p, n) {
+    if (length(x) >= n) {
+      return(signal::sgolayfilt(x, p = p, n = n))
+    } else {
+      return(x)
+    }
+  }
+  
+  # Apply Savitzky-Golay smoothing 
+  smoothed_subset <- reconstructed_path$tracks |>
+    filter(!is.na(x_filled), !is.na(y_filled)) |>
+    group_by(individual_number) |>
+    arrange(time) |>
+    mutate(
+      x_smooth_sg = safe_sgolay(x_filled, p = 3, n = 13),
+      y_smooth_sg = safe_sgolay(y_filled, p = 3, n = 13)
+    ) |>
+    ungroup() |>
+    select(time, individual_number, x_smooth_sg, y_smooth_sg)
+  
+  # Join smoothed values back to preserve temporal alignment
+  reconstructed_path$tracks <- reconstructed_path$tracks |>
+    left_join(smoothed_subset, by = c("time", "individual_number")) |>
+    mutate(
+      x_smooth = x_smooth_sg,
+      y_smooth = y_smooth_sg
+    ) |>
+    select(-x_smooth_sg, -y_smooth_sg, -x_filled, -y_filled)
+  
+  #attach metadata and apply calibration
+  linking_key <- paste0("d", meta_info$day, "-t", meta_info$trial, "-c", meta_info$camera)
+  calib_row <- group_avg_pixels |> filter(day_trial_camera == linking_key)
+  
+  if (nrow(calib_row) == 0) {
+    warning(sprintf("No calibration data found for %s (key: %s). Using NA.", session_id, linking_key))
+    px_per_cm <- NA_real_
+  } else {
+    px_per_cm <- calib_row$pixels_per_cm[1]
+  }
+  
+  smooth_df <- reconstructed_path$tracks |>
+    mutate(
+      path = meta_info$path,
+      session_name = meta_info$session_name,
+      day = meta_info$day,
+      trial = meta_info$trial,
+      camera = meta_info$camera,
+      phase = meta_info$phase,
+      ID = meta_info$ID,
+      treatment = meta_info$treatment,
+      information = meta_info$information,
+      pixels_per_cm = px_per_cm
+    ) |>
+    mutate(
+      x_smooth = x_smooth / px_per_cm,
+      y_smooth = y_smooth / px_per_cm
+    ) |>
+    group_by(individual_number) |>
+    arrange(time) |>
+    mutate(
+      velocity = sqrt((x_smooth - lag(x_smooth))^2 + (y_smooth - lag(y_smooth))^2) / (time - lag(time)),
+      acceleration = (velocity - lag(velocity)) / (time - lag(time)),
+      heading = atan2(y_smooth - lag(y_smooth), x_smooth - lag(x_smooth)),
+      turn_angle = heading - lag(heading),
+      turn_angle2 = atan2(sin(turn_angle), cos(turn_angle))
+    ) |>
+    ungroup()
+  
+  wide_df <- smooth_df |>
+    select(-segment, -x_reconstructed, -y_reconstructed) |>
+    tidyr::pivot_wider(
+      id_cols = c(time, path, session_name, day, trial, camera, phase, ID, treatment, information, pixels_per_cm),
+      names_from = individual_number,
+      values_from = c(x_original, y_original, x_smooth, y_smooth, velocity, acceleration, turn_angle, turn_angle2, heading),
+      names_sep = "_ind"
+    )
+  
+  out_path <- file.path(output_track_dir, paste0(session_id, ".csv"))
+  write_csv(wide_df, out_path)
+  
+  return(list(session_id = session_id, success = TRUE, n_demonstrators = n_demonstrators))
+  }, error = function(e) {
+    #this will catch any error and report which session failed
+    warning(sprintf("failed processing session %s: %s", session_id, e$message))
+    return(list(session_id = session_id, success = FALSE, n_demonstrators = 0, 
+                error_msg = e$message))
+  })
+}
+
+# Process all sessions in parallel with progress updates
+results <- future_map(
+  focal_csvs,
+  ~ process_single_session(.x, demonstrators_csvs, group_avg_pixels, reconstruct_or_not_df),
+  .options = furrr_options(seed = TRUE),
+  .progress = TRUE
+)
+
+# Reset to sequential processing
+plan(sequential)
+```
+
+
+# 3. HMM Behavioural states
+
+## 3.1 read in smoothed tracks
+```{r load_smoothed_tracks, message=FALSE}
+smoothed_track_dir <- "./2-data/2-smoothed_tracks"
+
+smoothed_files <- list.files(
+  path = smoothed_track_dir,
+  pattern = "\\.csv$",
+  full.names = TRUE) |>
+  (\(x) x[!grepl("^\\._", basename(x))])()
+
+combined_df <- map_dfr(smoothed_files, read_csv, show_col_types = FALSE)
+```
+
+## 3.2 Prepare all individuals in long format
+
+Pivot all individuals (focal + demonstrators) into one long-format dataframe. `moveHMM::prepData()` uses the `ID` column to treat each individual-session as an independent track, so we fit a single HMM pooling all data.
+
+```{r prepare_hmm_long, message=FALSE, warning=FALSE}
+# Pivot all individuals to long format and generate the columns required for moveHMM
+hmm_long <- combined_df |>
+  select(time, session_name, matches("^[xy]_smooth_ind[1-4]$")) |>
+  pivot_longer(
+    cols = matches("^[xy]_smooth_ind[1-4]$"),
+    names_to = c(".value", "ind"),
+    names_pattern = "^(x_smooth|y_smooth)_(ind[1-4])$"
+  ) |>
+  rename(x = x_smooth, y = y_smooth) |>
+  filter(!is.na(x) & !is.na(y)) |>
+  mutate(ID = paste0(session_name, "__", ind)) |>
+  arrange(ID, time) |>
+  # Average to 1-second resolution as the HMM starts to fail at higher resolutions
+  mutate(second = floor(time)) |>
+  group_by(ID, session_name, ind, second) |>
+  summarise(x = mean(x), y = mean(y), .groups = "drop") |>
+  rename(time = second)
+
+cat(sprintf(
+  "Long-format HMM data: %d rows, %d unique tracks (%d sessions × up to 4 individuals)\n",
+  nrow(hmm_long), n_distinct(hmm_long$ID), n_distinct(hmm_long$session_name)
+))
+
+
+data_hmm <- prepData(hmm_long, type = "UTM", coordNames = c("x", "y"))
+```
+
+## 3.3 Fit single global HMM
+
+```{r fit_global_hmm}
+mu0 <- c(0.01, 1)
+sigma0 <- c(0.1, 1)
+zeromass0 <- c(0.05, 0.00001)
+stepPar0 <- c(mu0, sigma0, zeromass0)
+
+angleMean0 <- c(0, 0)
+kappa0 <- c(0.1, 1)
+anglePar0 <- c(angleMean0, kappa0)
+
+m_all <- fitHMM(
+  data = data_hmm,
+  nbStates = 2,
+  stepDist = "gamma",
+  stepPar0 = stepPar0,
+  angleDist = "vm",
+  anglePar0 = anglePar0
+)
+
+m_all
+```
+
+## 3.4 Decode states and save updated CSVs
+
+```{r decode_and_save}
+# Viterbi decode all tracks at once
+states <- viterbi(m_all)
+freezing_state <- which.min(m_all$mle$stepPar[1, ])
+
+hmm_decoded <- data_hmm |>
+  as_tibble() |>
+  mutate(
+    state = states,
+    behaviour = if_else(state == freezing_state, "freezing", "moving")
+  )
+
+cat(sprintf("Decoded %d observations. Freezing state = %d\n", nrow(hmm_decoded), freezing_state))
+
+behaviour_lookup <- hmm_decoded |>
+  select(ID, time, behaviour) |>
+  tidyr::separate_wider_delim(ID, delim = "__", names = c("session_name", "ind")) |>
+  rename(time_second = time)
+
+# Pivot to wide so each individual gets its own behaviour column
+behaviour_wide <- behaviour_lookup |>
+  mutate(ind = paste0("behaviour_", ind)) |>
+  pivot_wider(names_from = ind, values_from = behaviour)
+
+# Write updated CSVs
+smoothed_track_dir <- "./2-data/2-smoothed_tracks"
+output_track_dir_updated <- "./2-data/3-behaviour_tracks"
+
+all_sessions <- unique(behaviour_wide$session_name)
+updated_count <- 0
+
+for (session_id in all_sessions) {
+  csv_path <- file.path(smoothed_track_dir, paste0(session_id, ".csv"))
+  if (!file.exists(csv_path)) {
+    warning(sprintf("CSV not found for session %s", session_id))
+    next
+  }
+
+  session_df <- read_csv(csv_path, show_col_types = FALSE) |>
+    select(-any_of(c("behaviour", paste0("behaviour_ind", 1:4)))) |>
+    mutate(time_second = floor(time))
+
+  session_beh <- behaviour_wide |>
+    filter(session_name == session_id) |>
+    select(-session_name)
+
+  session_df <- session_df |>
+    left_join(session_beh, by = "time_second") |>
+    select(-time_second)
+
+  write_csv(session_df, file.path(output_track_dir_updated, paste0(session_id, ".csv")))
+  updated_count <- updated_count + 1
+  if (updated_count %% 25 == 0) cat("Updated", updated_count, "files...\n")
+}
+
+cat(sprintf("\nUpdated %d CSV files with behaviour columns (behaviour_ind1–ind4).\n", updated_count))
+```
+
+## 3.5 Plot a sample of sessions with behavioural states
+
+```{r plot_sample_sessions}
+# Keep only focal fish (ind1) for the sample plot
+hmm_focal_df_with_states <- hmm_decoded |>
+  filter(grepl("__ind1$", ID))
+
+sample_sessions <- unique(hmm_focal_df_with_states$ID)[1:min(14, length(unique(hmm_focal_df_with_states$ID)))]
+
+df_sample <- hmm_focal_df_with_states |>
+  filter(ID %in% sample_sessions)
+
+ggplot(df_sample, aes(x = time, y = step, color = behaviour)) +
+  geom_point(alpha = 0.6, size = 1) +
+  scale_color_manual(
+    values = c("freezing" = "#E31A1C", "moving" = "#1F78B4"),
+    labels = c("Freezing", "Moving")
+  ) +
+  labs(
+    title = "Movement Speed with HMM-Detected Behavioural States (Sample Sessions)",
+    x = "Time (s)",
+    y = "Step Length (cm/s)",
+    color = "Behavioural State"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(face = "bold"),
+    strip.text = element_text(size = 7)
+  ) +
+  facet_wrap(~ID, ncol = 2)
+```
+
+# 4. Spatial use
+
+Here we go and collect the ROI lists from the corresponding .toml files for each "focal" track to get the coordinates of the arena (provided in pixels). Then I use 'sf' to get distance from the edge of the arena (thigmotaxis) and the distance from the top of the arena (i.e., the side closest to the demonstrators; social proximity).
+
+Specifically, this code loops through each smoothed track .csv and find its corresponding .toml file, reads in the ROI coordinates, create an sf object with the ROI, and then calculates the distance from each smoothed point to the edge of the ROI and the top of the ROI (the demonstrators side). This code also generates a plot for each track showing the fishes movement inside the ROI for verification of both the tracking quality and the specification of the arena and demonstrator side.
+
+## 4.1 Functions to extract arena
+
+```{r spatial_setup}
+# Function to parse ROI polygon from TOML format
+parse_roi_polygon <- function(roi_string) {
+  coords_match <- str_extract_all(roi_string, "\\[\\d+\\.?\\d*, \\d+\\.?\\d*\\]")[[1]]
+  
+  coords <- lapply(coords_match, function(coord) {
+    nums <- as.numeric(str_extract_all(coord, "\\d+\\.?\\d*")[[1]])
+    return(nums)
+  })
+  
+  coord_matrix <- do.call(rbind, coords)
+  coord_matrix <- rbind(coord_matrix, coord_matrix[1, ])
+  
+  return(coord_matrix)
+}
+
+# Function to read TOML file and extract ROI
+read_toml_roi <- function(toml_path) {
+  if (!file.exists(toml_path)) {
+    warning(sprintf("TOML file not found: %s", toml_path))
+    return(NULL)
+  }
+
+  lines <- readLines(toml_path)
+  
+  roi_lines <- lines[grepl("roi_list", lines) | grepl("Polygon", lines)]
+  
+  positive_roi_lines <- roi_lines[grepl("\\+\\s*Polygon", roi_lines)]
+  
+  if (length(positive_roi_lines) == 0) {
+    positive_roi_lines <- roi_lines[!grepl("-\\s*Polygon", roi_lines) & grepl("Polygon", roi_lines)]
+  }
+  
+  roi_string <- paste(positive_roi_lines, collapse = " ")
+  
+  if (grepl("Polygon", roi_string)) {
+    coords <- parse_roi_polygon(roi_string)
+    return(coords)
+  } else {
+    warning(sprintf("No positive polygon found in: %s", toml_path))
+    return(NULL)
+  }
+}
+
+# Function to find the "top edge" of an irregular polygon (demonstrator side) [surprisingly more complex to do than I thought it would be]
+# Approach: 
+# 1. Get the bounding box to find where "top" is
+# 2. Find all polygon edges near the top (within 15% of bbox top)
+# 3. Select the longest edge - that's the main demonstrator side
+# 4. Add any connected edges that share a vertex AND are >= 40% of best_edge length
+get_demonstrator_edge <- function(polygon_coords, arena_sf) {
+  bbox <- st_bbox(arena_sf)
+  arena_height <- bbox["ymax"] - bbox["ymin"]
+  top_threshold <- bbox["ymin"] + (arena_height * 0.15)
+  
+  n_points <- nrow(polygon_coords) - 1
+  coords <- polygon_coords[1:n_points, ]
+  
+  edges <- data.frame(
+    idx = 1:n_points,
+    x1 = coords[, 1],
+    y1 = coords[, 2],
+    x2 = c(coords[-1, 1], coords[1, 1]),
+    y2 = c(coords[-1, 2], coords[1, 2])
+  )
+  
+  edges$mid_y <- (edges$y1 + edges$y2) / 2
+  edges$length <- sqrt((edges$x2 - edges$x1)^2 + (edges$y2 - edges$y1)^2)
+  
+  top_edges <- edges[edges$mid_y <= top_threshold, ]
+  
+  if (nrow(top_edges) == 0) {
+    best_edge <- edges[which.min(edges$mid_y), ]
+  } else {
+    best_edge <- top_edges[which.max(top_edges$length), ]
+  }
+  
+  length_threshold <- best_edge$length * 0.4
+  best_edge_angle <- atan2(best_edge$y2 - best_edge$y1, best_edge$x2 - best_edge$x1) * 180 / pi
+  
+  # Helper function to check if two edges share a vertex
+  shares_vertex <- function(e1, e2) {
+    (e2$x1 == e1$x1 && e2$y1 == e1$y1) ||
+    (e2$x1 == e1$x2 && e2$y1 == e1$y2) ||
+    (e2$x2 == e1$x1 && e2$y2 == e1$y1) ||
+    (e2$x2 == e1$x2 && e2$y2 == e1$y2)
+  }
+  
+  # Helper function to check if two edges are nearly parallel (within 10 degrees)
+  is_nearly_parallel <- function(e1_angle, e2) {
+    e2_angle <- atan2(e2$y2 - e2$y1, e2$x2 - e2$x1) * 180 / pi
+    angle_diff <- abs(e1_angle - e2_angle)
+    angle_diff <- min(angle_diff, 360 - angle_diff)
+    if (angle_diff > 90) angle_diff <- 180 - angle_diff
+    return(angle_diff <= 10)
+  }
+  
+  connected_edges <- edges[edges$idx != best_edge$idx, ]
+  connected_edges <- connected_edges[sapply(1:nrow(connected_edges), function(i) {
+    shares_vertex(best_edge, connected_edges[i, ])
+  }), ]
+  
+  qualifying_connected <- connected_edges[
+    connected_edges$length >= length_threshold & 
+    sapply(1:nrow(connected_edges), function(i) {
+      is_nearly_parallel(best_edge_angle, connected_edges[i, ])
+    }), ]
+  
+  all_selected_edges <- rbind(best_edge, qualifying_connected)
+  
+  all_points <- unique(rbind(
+    data.frame(x = all_selected_edges$x1, y = all_selected_edges$y1),
+    data.frame(x = all_selected_edges$x2, y = all_selected_edges$y2)
+  ))
+  
+ if (nrow(all_points) == 2) {
+    top_edge <- matrix(
+      c(best_edge$x1, best_edge$y1,
+        best_edge$x2, best_edge$y2),
+      ncol = 2, byrow = TRUE
+    )
+    return(st_linestring(top_edge))
+  }
+  
+  edge_list <- lapply(1:nrow(all_selected_edges), function(i) {
+    list(
+      p1 = c(all_selected_edges$x1[i], all_selected_edges$y1[i]),
+      p2 = c(all_selected_edges$x2[i], all_selected_edges$y2[i])
+    )
+  })
+  
+  point_counts <- table(paste(
+    c(all_selected_edges$x1, all_selected_edges$x2),
+    c(all_selected_edges$y1, all_selected_edges$y2),
+    sep = ","
+  ))
+  endpoints <- names(point_counts[point_counts == 1])
+  
+  if (length(endpoints) >= 1) {
+    start_coords <- as.numeric(strsplit(endpoints[1], ",")[[1]])
+    
+    ordered_points <- matrix(start_coords, ncol = 2, byrow = TRUE)
+    current_point <- start_coords
+    used_edges <- logical(length(edge_list))
+    
+    for (iter in 1:length(edge_list)) {
+      found <- FALSE
+      for (i in which(!used_edges)) {
+        edge <- edge_list[[i]]
+        if (all(edge$p1 == current_point)) {
+          ordered_points <- rbind(ordered_points, edge$p2)
+          current_point <- edge$p2
+          used_edges[i] <- TRUE
+          found <- TRUE
+          break
+        } else if (all(edge$p2 == current_point)) {
+          ordered_points <- rbind(ordered_points, edge$p1)
+          current_point <- edge$p1
+          used_edges[i] <- TRUE
+          found <- TRUE
+          break
+        }
+      }
+      if (!found) break
+    }
+    
+    return(st_linestring(ordered_points))
+  } else {
+    top_edge <- matrix(
+      c(best_edge$x1, best_edge$y1,
+        best_edge$x2, best_edge$y2),
+      ncol = 2, byrow = TRUE
+    )
+    return(st_linestring(top_edge))
+  }
+}
+```
+
+## 4.2 Process each session - calculate spatial metrics
+
+```{r spatial_processing, message=FALSE, warning=FALSE}
+smoothed_track_dir <- "./2-data/3-behaviour_tracks"
+toml_dir <- "./2-data/1-raw_tracks"
+spatial_output_dir <- "./3-figs/spatial_checks"
+
+smoothed_files <- list.files(
+  path = smoothed_track_dir,
+  pattern = "\\.csv$",
+  full.names = TRUE) |>
+  (\(x) x[!grepl("^\\._", basename(x))])() |>
+  (\(x) x[grepl("focal", x)])() 
+
+spatial_results <- list()
+
+for (i in seq_along(smoothed_files)) {
+  csv_path <- smoothed_files[i]
+  session_name <- tools::file_path_sans_ext(basename(csv_path))
+  toml_path <- file.path(toml_dir, paste0(session_name, ".toml"))
+  
+  roi_coords <- read_toml_roi(toml_path)
+
+  if (is.null(roi_coords)) {
+    warning(sprintf("Skipping %s - no ROI found", session_name))
+    next
+  }
+  
+  track_df <- read_csv(csv_path, show_col_types = FALSE)
+  
+  # Get the pixels_per_cm for this session
+  px_per_cm <- track_df$pixels_per_cm[1]
+  
+  if (is.na(px_per_cm)) {
+    warning(sprintf("Skipping %s - no calibration data", session_name))
+    next
+  }
+  
+  # Convert smoothed coordinates back to pixels for spatial analysis
+  track_df <- track_df |>
+    mutate(
+      x_px = x_smooth_ind1 * px_per_cm,
+      y_px = y_smooth_ind1 * px_per_cm
+    ) |>
+    filter(!is.na(x_px) & !is.na(y_px))
+  
+  # Create sf objects
+  # Arena polygon
+  arena_polygon <- st_polygon(list(roi_coords))
+  arena_sf <- st_sfc(arena_polygon)
+  arena_boundary <- st_boundary(arena_sf)
+  
+  # Get the demonstrator edge using the smart function
+  demonstrator_edge <- get_demonstrator_edge(roi_coords, arena_sf)
+  demonstrator_edge_sf <- st_sfc(demonstrator_edge)
+  
+  # Extract coordinates for plotting
+  demonstrator_edge_coords <- st_coordinates(demonstrator_edge)
+  
+  # Fish positions as points
+  fish_points <- st_as_sf(track_df, coords = c("x_px", "y_px"))
+  
+  # Calculate distances
+  # Distance to arena edge (boundary)
+  dist_to_edge_px <- as.numeric(st_distance(fish_points, arena_boundary))
+  
+  # Distance to demonstrator edge
+  dist_to_top_px <- as.numeric(st_distance(fish_points, demonstrator_edge_sf))
+  
+  # Convert distances to cm
+  track_df <- track_df |>
+    mutate(
+      dist_to_edge_cm = dist_to_edge_px / px_per_cm,
+      dist_to_top_cm = dist_to_top_px / px_per_cm
+    )
+  
+  # Check if points are inside the arena
+  points_inside <- st_within(fish_points, arena_sf, sparse = FALSE)[, 1]
+  track_df$inside_arena <- points_inside
+  
+  # Store results
+  spatial_results[[session_name]] <- track_df
+  
+  # Create diagnostic plot for each session
+  spatial_plot <- ggplot() +
+    geom_polygon(data = as.data.frame(roi_coords), aes(x = V1, y = V2), fill = "lightblue", alpha = 0.3, color = "black", linewidth = 1) +
+    geom_segment(aes(x = demonstrator_edge_coords[1, "X"], y = demonstrator_edge_coords[1, "Y"], xend = demonstrator_edge_coords[2, "X"], yend = demonstrator_edge_coords[2, "Y"]), color = "red", linewidth = 2) +
+    geom_point(data = as.data.frame(demonstrator_edge_coords), aes(x = X, y = Y), color = "red", size = 3) +
+    geom_path(data = track_df, aes(x = x_px, y = y_px), alpha = 0.3, color = "gray40") +
+    geom_point(data = track_df, aes(x = x_px, y = y_px, color = dist_to_top_cm), size = 0.5, alpha = 0.5) +
+    scale_color_viridis_c(option = "plasma", name = "Distance to\ndemo. (cm)") +
+    scale_y_reverse() +
+    coord_fixed() +
+    labs(
+      title = paste("Spatial Analysis:", session_name),
+      subtitle = sprintf("Points inside arena: %.1f%% | Red line = demonstrator edge", mean(points_inside) * 100),
+      x = "X (pixels)", y = "Y (pixels)") +
+    theme_minimal() +
+    theme(legend.position = "right")
+  
+  ggsave(filename = file.path(spatial_output_dir, paste0(session_name, "_spatial.png")), plot = spatial_plot, width = 10, height = 8, dpi = 150)
+  
+  # progress update
+  if (i %% 25 == 0) cat("Processed", i, "of", length(smoothed_files), "files\n")
+}
+
+cat("Spatial processing complete!\n")
+cat("Diagnostic plots saved to:", spatial_output_dir, "\n")
+cat("Total plots saved:", length(spatial_results), "\n")
+```
+
+## 4.3 Update smoothed CSVs with spatial metrics
+
+```{r save_spatial_metrics, message=FALSE}
+updated_count <- 0
+
+for (session_name in names(spatial_results)) {
+  track_df <- spatial_results[[session_name]]
+  
+  spatial_cols <- track_df |>
+    select(time, dist_to_edge_cm, dist_to_top_cm, inside_arena)
+  
+  csv_path <- file.path(smoothed_track_dir, paste0(session_name, ".csv"))
+  original_df <- read_csv(csv_path, show_col_types = FALSE)
+  
+  original_df <- original_df |>
+    select(-any_of(c("dist_to_edge_cm", "dist_to_top_cm", "inside_arena")))
+  
+  updated_df <- original_df |>
+    left_join(spatial_cols, by = "time")
+  
+  write_csv(updated_df, csv_path)
+  updated_count <- updated_count + 1
+  print(updated_count)
+}
+
+cat("Updated", updated_count, "CSV files with spatial metrics.\n")
+```
+
+# 5. Final dataframe and blinding
+
+The response variables of interest
+
+*activity (focal)*
+
+-   latency to start moving (time until sliding window proportion > 0.5) == "latency_to_moving"
+
+-   Recovery to baseline behavioural levels (Recovery time was defined as the earliest changepoint occurring after 300 seconds where (1) the similarity at the
+changepoint exceeded a threshold of 0.8, (2) the mean similarity from that changepoint to the end of the trial exceeded 0.8, and (3) the mean similarity after the changepoint was greater than the mean similarity of the preceding segment, indicating a sustained return to baseline-like behaviour rather than a transient fluctuation. Individuals that did not meet these criteria were classified as not having recovered within the trial period.)
+
+
+## 5.1 Example track
+
+Here is an example of one track with the mentioned response variables calculated.
+
+```{r helper_functions}
+# ---------------------------------------------------------------------------
+# Helper: Detect time at which a fish returns to baseline behaviour
+# Uses velocity and prop_moving to build a similarity score, with changepoint
+# detection (PELT, BIC) on the smoothed similarity time-series.
+#
+# Arguments
+#   trial_temporal   – per-second temporal df for the TRIAL phase
+#   baseline_temporal – per-second temporal df for the matching BASELINE phase
+#   velocity_col     – name of the velocity column (character)
+#   moving_col       – name of the binary behavioural-state column (character)
+#   rolling_k        – window width (seconds) for rolling means
+#   smooth_k         – additional smoothing window for similarity
+#   min_time         – ignore changepoints before this many seconds
+#   similarity_threshold – minimum post-changepoint similarity to qualify
+#
+# Returns a named list: recovery_time, similarity_before, similarity_after,
+#   returned_to_baseline (logical), baseline_velocity_mean, baseline_velocity_sd,
+#   baseline_prop_moving_mean, baseline_prop_moving_sd
+# ---------------------------------------------------------------------------
+detect_recovery_time <- function(trial_temporal,
+                                  baseline_temporal,
+                                  velocity_col = "velocity_cm_s",
+                                  moving_col = "behaviour_ind1_numeric",
+                                  rolling_k = 60,
+                                  smooth_k = 30,
+                                  min_time = 300,
+                                  similarity_threshold = 0.8) {
+
+  # ---- empty-result template ------------------------------------------------
+  empty_result <- list(
+    recovery_time = NA_real_,
+    similarity_before = NA_real_,
+    similarity_after = NA_real_,
+    returned_to_baseline = FALSE,
+    baseline_velocity_mean = NA_real_,
+    baseline_velocity_sd = NA_real_,
+    baseline_prop_moving_mean = NA_real_,
+    baseline_prop_moving_sd = NA_real_
+  )
+
+  # ---- guard: need baseline data --------------------------------------------
+  if (is.null(baseline_temporal) || nrow(baseline_temporal) < rolling_k) {
+    return(empty_result)
+  }
+
+  # ---- baseline profile -----------------------------------------------------
+  bl_vel <- baseline_temporal[[velocity_col]]
+  bl_move <- baseline_temporal[[moving_col]]
+
+  bl_profile <- list(
+    vel_mean = mean(bl_vel, na.rm = TRUE),
+    vel_sd = sd(bl_vel, na.rm = TRUE),
+    move_mean = mean(bl_move, na.rm = TRUE),
+    move_sd = sd(bl_move, na.rm = TRUE)
+  )
+
+  # ---- trial rolling means --------------------------------------------------
+  trial_vel <- trial_temporal[[velocity_col]]
+  trial_move <- trial_temporal[[moving_col]]
+  trial_time <- trial_temporal$time
+
+  if (length(trial_vel) < rolling_k) return(empty_result)
+
+  vel_rolling <- zoo::rollmean(trial_vel, k = rolling_k, fill = NA, align = "center")
+  move_rolling <- zoo::rollmean(trial_move, k = rolling_k, fill = NA, align = "center")
+
+  # ---- normalised deviations ------------------------------------------------
+  # Only penalize when BELOW baseline (slower/less moving = still frozen)
+  # Being above baseline (faster/more moving) is fine - not penalized
+  vel_dev <- pmax(0, bl_profile$vel_mean - vel_rolling) /
+    (bl_profile$vel_sd + 0.001)                        # velocity z-score distance (only if below)
+
+  move_dev <- pmax(0, bl_profile$move_mean - move_rolling) /
+    (bl_profile$move_sd + 0.001)                       # prop_moving z-score distance (only if below)
+
+  similarity <- 1 / (1 + 0.5 * vel_dev + 0.5 * move_dev)
+  sim_smooth <- zoo::rollmean(similarity, k = smooth_k, fill = NA, align = "center")
+
+  # ---- changepoint detection ------------------------------------------------
+  valid_idx <- which(!is.na(sim_smooth))
+  if (length(valid_idx) < 100) return(empty_result)
+
+  sim_valid <- sim_smooth[valid_idx]
+
+  cpt <- tryCatch(
+    changepoint::cpt.meanvar(
+      sim_valid,
+      method = "PELT",
+      penalty = "BIC",
+      minseglen = 60
+    ),
+    error = function(e) NULL
+  )
+
+  if (is.null(cpt)) return(empty_result)
+
+  cps <- changepoint::cpts(cpt)
+  seg_means <- changepoint::param.est(cpt)$mean
+
+  # ---- find first qualifying recovery changepoint ---------------------------
+  recovery_time <- NA_real_
+  sim_before <- NA_real_
+  sim_after <- NA_real_
+
+  if (length(cps) > 0) {
+    for (i in seq_along(cps)) {
+      cp_idx  <- cps[i]
+      cp_time <- trial_time[valid_idx[cp_idx]]
+      if (cp_time < min_time) next
+      
+      # Similarity at the changepoint itself
+      sim_at_cp <- sim_valid[cp_idx]
+      
+      # Calculate mean similarity from this changepoint to END of trial
+      mean_after_cp <- mean(sim_valid[cp_idx:length(sim_valid)], na.rm = TRUE)
+      
+      if (i < length(seg_means)) {
+        before <- seg_means[i]
+        # Check: (1) changepoint itself >= threshold, (2) mean onwards >= threshold, (3) represents an increase
+        if (sim_at_cp >= similarity_threshold && 
+            mean_after_cp >= similarity_threshold && 
+            mean_after_cp > before) {
+          recovery_time <- cp_time
+          sim_before <- before
+          sim_after <- mean_after_cp
+          break
+        }
+      }
+    }
+  }
+
+  list(
+    recovery_time = recovery_time,
+    similarity_before = sim_before,
+    similarity_after = sim_after,
+    returned_to_baseline = !is.na(recovery_time),
+    baseline_velocity_mean = bl_profile$vel_mean,
+    baseline_velocity_sd = bl_profile$vel_sd,
+    baseline_prop_moving_mean = bl_profile$move_mean,
+    baseline_prop_moving_sd = bl_profile$move_sd
+  )
+}
+```
+
+
+```{r example_track_setup}
+example_df <- read_csv("./2-data/3-behaviour_tracks/d1-t2-c1-t-1h2-i-focal.csv", show_col_types = FALSE)
+```
+
+### 5.1.1 Create per-second temporal dataframe
+
+```{r example_temporal_df}
+# Parameters
+thigmotaxis_threshold_cm <- 3
+proximity_threshold_cm <- 3
+sliding_window_seconds <- 60
+
+# Determine the time range where the FOCAL fish (ind1) has valid tracking data
+# This ensures the temporal_df only covers the period when the focal fish is present
+# (demonstrators may start earlier in trial sessions)
+example_df_with_valid <- example_df |>
+  mutate(
+    has_valid_data = !is.na(x_smooth_ind1) & !is.na(y_smooth_ind1)
+  )
+
+valid_indices <- which(example_df_with_valid$has_valid_data)
+first_valid_time <- example_df_with_valid$time[min(valid_indices)]
+last_valid_time <- example_df_with_valid$time[max(valid_indices)]
+
+cat("First valid tracking time:", first_valid_time, "s\n")
+cat("Last valid tracking time:", last_valid_time, "s\n")
+
+# Filter example_df to only include data within the valid time range
+example_df_filtered <- example_df |>
+  filter(time >= first_valid_time & time <= last_valid_time)
+
+# Aggregate to per-second values
+temporal_df <- example_df_filtered |>
+  mutate(second = floor(time)) |>
+  group_by(second) |>
+  summarise(
+    # Position (mean per second)
+    x_cm = mean(x_smooth_ind1, na.rm = TRUE),
+    y_cm = mean(y_smooth_ind1, na.rm = TRUE),
+    
+    # Velocity (mean per second)
+    velocity_cm_s = mean(velocity_ind1, na.rm = TRUE),
+    
+    # behavioural state - proportion of frames moving in this second
+    n_frames = n(),
+    n_moving = sum(behaviour_ind1 == "moving", na.rm = TRUE),
+    prop_moving_instant = n_moving / n_frames,
+    
+    # Demonstrator behavioural states - proportion of frames moving
+    n_moving_ind2 = if ("behaviour_ind2" %in% names(example_df)) sum(behaviour_ind2 == "moving", na.rm = TRUE) else NA_real_,
+    prop_moving_instant_ind2 = if ("behaviour_ind2" %in% names(example_df)) n_moving_ind2 / n_frames else NA_real_,
+    
+    n_moving_ind3 = if ("behaviour_ind3" %in% names(example_df)) sum(behaviour_ind3 == "moving", na.rm = TRUE) else NA_real_,
+    prop_moving_instant_ind3 = if ("behaviour_ind3" %in% names(example_df)) n_moving_ind3 / n_frames else NA_real_,
+    
+    n_moving_ind4 = if ("behaviour_ind4" %in% names(example_df)) sum(behaviour_ind4 == "moving", na.rm = TRUE) else NA_real_,
+    prop_moving_instant_ind4 = if ("behaviour_ind4" %in% names(example_df)) n_moving_ind4 / n_frames else NA_real_,
+    
+    # Spatial metrics (mean per second)
+    dist_to_edge_cm = mean(dist_to_edge_cm, na.rm = TRUE),
+    dist_to_top_cm = mean(dist_to_top_cm, na.rm = TRUE),
+    
+    # Binary thigmotaxis (proportion of frames within threshold)
+    prop_near_edge = mean(dist_to_edge_cm < thigmotaxis_threshold_cm, na.rm = TRUE),
+    
+    # Binary social proximity (proportion of frames within threshold)
+    prop_near_demonstrator = mean(dist_to_top_cm < proximity_threshold_cm, na.rm = TRUE),
+    
+    # Behavioural states as numeric (moving = 1, freezing = 0) 
+    behaviour_ind1_numeric = mean(behaviour_ind1 == "moving", na.rm = TRUE),
+    behaviour_ind2_numeric = if ("behaviour_ind2" %in% names(example_df)) mean(behaviour_ind2 == "moving", na.rm = TRUE) else NA_real_,
+    behaviour_ind3_numeric = if ("behaviour_ind3" %in% names(example_df)) mean(behaviour_ind3 == "moving", na.rm = TRUE) else NA_real_,
+    behaviour_ind4_numeric = if ("behaviour_ind4" %in% names(example_df)) mean(behaviour_ind4 == "moving", na.rm = TRUE) else NA_real_,
+    
+    .groups = "drop"
+  ) |>
+  rename(time = second) |>
+  arrange(time)
+
+# Add trial_time column (starts at 0 from first valid tracking data)
+first_time_in_temporal <- min(temporal_df$time)
+temporal_df <- temporal_df |>
+  mutate(trial_time = time - first_time_in_temporal)
+
+# Calculate sliding window proportion of time moving (1-minute window centered on each second)
+# Using zoo::rollapply for the sliding window with partial=TRUE to handle edges
+temporal_df <- temporal_df |>
+  mutate(
+    # Sliding window proportion moving (centered, 60s window)
+    # partial=TRUE allows smaller windows at the edges
+    prop_moving_sliding = zoo::rollapply(
+      prop_moving_instant,
+      width = sliding_window_seconds,
+      FUN = mean,
+      fill = NA,
+      align = "center",
+      na.rm = TRUE,
+      partial = TRUE
+    ),
+    
+    # Demonstrator sliding window proportions
+    prop_moving_sliding_ind2 = zoo::rollapply(
+      prop_moving_instant_ind2,
+      width = sliding_window_seconds,
+      FUN = mean,
+      fill = NA,
+      align = "center",
+      na.rm = TRUE,
+      partial = TRUE
+    ),
+    
+    prop_moving_sliding_ind3 = zoo::rollapply(
+      prop_moving_instant_ind3,
+      width = sliding_window_seconds,
+      FUN = mean,
+      fill = NA,
+      align = "center",
+      na.rm = TRUE,
+      partial = TRUE
+    ),
+    
+    prop_moving_sliding_ind4 = zoo::rollapply(
+      prop_moving_instant_ind4,
+      width = sliding_window_seconds,
+      FUN = mean,
+      fill = NA,
+      align = "center",
+      na.rm = TRUE,
+      partial = TRUE
+    ),
+    
+    # Average demonstrator sliding window proportion
+    prop_moving_sliding_demonstrators = rowMeans(
+      cbind(prop_moving_sliding_ind2, prop_moving_sliding_ind3, prop_moving_sliding_ind4),
+      na.rm = TRUE
+    )
+  )
+
+# Add metadata columns
+temporal_df <- temporal_df |>
+  mutate(
+    session_name = "d2-t1-c10-t-2l3-i",
+    day = example_df$day[1],
+    trial = example_df$trial[1],
+    camera = example_df$camera[1],
+    phase = example_df$phase[1],
+    ID = example_df$ID[1],
+    treatment = example_df$treatment[1],
+    information = example_df$information[1]
+  )
+
+cat("Temporal dataframe created with", nrow(temporal_df), "rows (seconds)\n")
+head(temporal_df)
+```
+
+### 5.1.2 Create whole-trial summary dataframe
+
+```{r example_summary_df}
+# Calculate whole-trial summary metrics
+summary_df <- temporal_df |>
+  summarise(
+    # Metadata
+    session_name = first(session_name),
+    day = first(day),
+    trial = first(trial),
+    camera = first(camera),
+    phase = first(phase),
+    ID = first(ID),
+    treatment = first(treatment),
+    information = first(information),
+    
+    # Trial duration
+    duration_s = max(time) - min(time) + 1,
+    
+    # ===== FREEZING METRICS =====
+    # Total time spent moving (seconds where majority of frames were moving)
+    total_time_moving = sum(prop_moving_instant > 0.5, na.rm = TRUE),
+    
+    # Proportion of trial spent moving
+    prop_time_moving = total_time_moving / duration_s,
+    
+    # Latency to start moving more than freezing
+    # (time until sliding window proportion > 0.5)
+    latency_to_moving = {
+      idx <- which(prop_moving_sliding > 0.5)
+      if (length(idx) > 0) trial_time[min(idx)] else NA_real_
+    },
+    
+    # Mean velocity
+    mean_velocity_cm = mean(velocity_cm_s, na.rm = TRUE),
+    
+    # ===== REACTION TIME (time to first freeze) =====
+    # Time until focal fish first freezes (sliding window proportion <= 0.5)
+    reaction_time_ind1 = {
+      idx <- which(behaviour_ind1_numeric <= 0.5)
+      if (length(idx) > 0) trial_time[min(idx)] else NA_real_
+    },
+    # Distance from demonstrators at time of first freeze
+    reaction_distance_from_dems = {
+      idx <- which(behaviour_ind1_numeric <= 0.5)
+      if (length(idx) > 0) dist_to_top_cm[min(idx)] else NA_real_
+    },
+    # Reaction time for each demonstrator
+    reaction_time_ind2 = {
+      idx <- which(behaviour_ind2_numeric <= 0.5)
+      if (length(idx) > 0) trial_time[min(idx)] else NA_real_
+    },
+    reaction_time_ind3 = {
+      idx <- which(behaviour_ind3_numeric <= 0.5)
+      if (length(idx) > 0) trial_time[min(idx)] else NA_real_
+    },
+    reaction_time_ind4 = {
+      idx <- which(behaviour_ind4_numeric <= 0.5)
+      if (length(idx) > 0) trial_time[min(idx)] else NA_real_
+    },
+    # Average reaction time across demonstrators
+    reaction_time_demonstrators = mean(
+      c(reaction_time_ind2, reaction_time_ind3, reaction_time_ind4),
+      na.rm = TRUE
+    ),
+    
+    # ===== DEMONSTRATOR FREEZING METRICS =====
+    # Proportion of time moving for each demonstrator
+    prop_time_moving_ind2 = mean(prop_moving_instant_ind2 > 0.5, na.rm = TRUE),
+    prop_time_moving_ind3 = mean(prop_moving_instant_ind3 > 0.5, na.rm = TRUE),
+    prop_time_moving_ind4 = mean(prop_moving_instant_ind4 > 0.5, na.rm = TRUE),
+    
+    # Average proportion of time moving across demonstrators
+    prop_time_moving_demonstrators = mean(c(prop_time_moving_ind2, prop_time_moving_ind3, prop_time_moving_ind4), na.rm = TRUE),
+    
+    # Latency to moving for each demonstrator
+    latency_to_moving_ind2 = {
+      idx <- which(prop_moving_sliding_ind2 > 0.5)
+      if (length(idx) > 0) trial_time[min(idx)] else NA_real_
+    },
+    latency_to_moving_ind3 = {
+      idx <- which(prop_moving_sliding_ind3 > 0.5)
+      if (length(idx) > 0) trial_time[min(idx)] else NA_real_
+    },
+    latency_to_moving_ind4 = {
+      idx <- which(prop_moving_sliding_ind4 > 0.5)
+      if (length(idx) > 0) trial_time[min(idx)] else NA_real_
+    },
+    
+    # Average latency to moving across demonstrators
+    latency_to_moving_demonstrators = mean(c(latency_to_moving_ind2, latency_to_moving_ind3, latency_to_moving_ind4), na.rm = TRUE),
+    
+    # ===== THIGMOTAXIS METRICS =====
+    # Total time within 3cm of edge
+    total_time_near_edge = sum(prop_near_edge > 0.5, na.rm = TRUE),
+    
+    # Proportion of trial near edge
+    prop_time_near_edge = total_time_near_edge / duration_s,
+    
+    # Mean distance to edge
+    mean_dist_to_edge_cm = mean(dist_to_edge_cm, na.rm = TRUE),
+    
+    # ===== SOCIAL PROXIMITY METRICS =====
+    # Total time within 3cm of demonstrator side (top edge)
+    total_time_near_demonstrator = sum(prop_near_demonstrator > 0.5, na.rm = TRUE),
+    
+    # Proportion of trial near demonstrator
+    prop_time_near_demonstrator = total_time_near_demonstrator / duration_s,
+    
+    # Mean distance to demonstrator side
+    mean_dist_to_top_cm = mean(dist_to_top_cm, na.rm = TRUE)
+  )
+
+# ===== RECOVERY TIME (CHANGEPOINT DETECTION) =====
+# Read the matching baseline file
+baseline_path <- "./2-data/3-behaviour_tracks/d2-t1-c10-b-2l3-i-focal.csv"
+
+baseline_temporal <- NULL
+if (file.exists(baseline_path)) {
+  bl_raw <- read_csv(baseline_path, show_col_types = FALSE) |>
+    filter(between(time, 300, 1500))
+  
+  if (nrow(bl_raw) > 0) {
+    baseline_temporal <- bl_raw |>
+      mutate(second = floor(time)) |>
+      group_by(second) |>
+      summarise(
+        velocity_cm_s = mean(velocity_ind1, na.rm = TRUE),
+        behaviour_ind1_numeric = mean(behaviour_ind1 == "moving", na.rm = TRUE),
+        .groups = "drop"
+      ) |>
+      rename(time = second)
+  }
+}
+
+# Detect recovery time for focal fish
+focal_recovery <- detect_recovery_time(
+  trial_temporal    = temporal_df,
+  baseline_temporal = baseline_temporal,
+  velocity_col      = "velocity_cm_s",
+  moving_col        = "behaviour_ind1_numeric"
+)
+
+# Add recovery metrics to summary
+summary_df <- summary_df |>
+  mutate(
+    recovery_time = focal_recovery$recovery_time,
+    returned_to_baseline = focal_recovery$returned_to_baseline,
+    recovery_similarity_before = focal_recovery$similarity_before,
+    recovery_similarity_after = focal_recovery$similarity_after,
+    baseline_velocity_mean = focal_recovery$baseline_velocity_mean,
+    baseline_velocity_sd = focal_recovery$baseline_velocity_sd,
+    baseline_prop_moving_mean = focal_recovery$baseline_prop_moving_mean,
+    baseline_prop_moving_sd = focal_recovery$baseline_prop_moving_sd,
+    
+    # ===== PRE-RECOVERY SPATIAL METRICS =====
+    # Seconds near edge before recovery (or full trial if no recovery)
+    time_near_edge_pre_recovery = {
+      cutoff <- ifelse(is.na(focal_recovery$recovery_time),
+                       max(temporal_df$time), focal_recovery$recovery_time)
+      sum(temporal_df$prop_near_edge[temporal_df$time <= cutoff] > 0.5, na.rm = TRUE)
+    },
+    # Seconds near demonstrator before recovery (or full trial if no recovery)
+    time_near_demonstrator_pre_recovery = {
+      cutoff <- ifelse(is.na(focal_recovery$recovery_time),
+                       max(temporal_df$time), focal_recovery$recovery_time)
+      sum(temporal_df$prop_near_demonstrator[temporal_df$time <= cutoff] > 0.5, na.rm = TRUE)
+    },
+    # Seconds spent moving before recovery (or full trial if no recovery)
+    time_moving_pre_recovery = {
+      cutoff <- ifelse(is.na(focal_recovery$recovery_time),
+                       max(temporal_df$time), focal_recovery$recovery_time)
+      sum(temporal_df$prop_moving_instant[temporal_df$time <= cutoff] > 0.5, na.rm = TRUE)
+    },
+    # Mean distance to edge before recovery
+    mean_dist_to_edge_pre_recovery = {
+      cutoff <- ifelse(is.na(focal_recovery$recovery_time),
+                       max(temporal_df$time), focal_recovery$recovery_time)
+      mean(temporal_df$dist_to_edge_cm[temporal_df$time <= cutoff], na.rm = TRUE)
+    },
+    # Mean distance to demonstrator before recovery
+    mean_dist_to_demonstrator_pre_recovery = {
+      cutoff <- ifelse(is.na(focal_recovery$recovery_time),
+                       max(temporal_df$time), focal_recovery$recovery_time)
+      mean(temporal_df$dist_to_top_cm[temporal_df$time <= cutoff], na.rm = TRUE)
+    }
+  )
+
+head(summary_df)
+```
+
+### 5.1.3 Visualize the example track
+
+```{r example_visualization, fig.width=10, fig.height=6}
+# Plot 1: Sliding window proportion moving over time (focal and demonstrators)
+p1 <- ggplot(temporal_df, aes(x = trial_time)) +
+  #geom_line(aes(y = prop_moving_sliding_demonstrators, color = "Demonstrators (avg)"), linewidth = 0.8) +
+  geom_line(aes(y = prop_moving_sliding, color = "Focal"), linewidth = 0.8) +
+  geom_hline(yintercept = 0.5, linetype = "dotted", color = "gray50", linewidth = 0.3) +
+  geom_hline(yintercept = 1, color = "gray30", linewidth = 0.3) +
+  geom_vline(
+    xintercept = summary_df$latency_to_moving,
+    linetype = "dotted", color = "darkgreen", linewidth = 0.8
+  ) +
+  annotate(
+    "text",
+    x = summary_df$latency_to_moving - 930,
+    y = 1.1,
+    label = paste0("Latency to move: ", round(summary_df$latency_to_moving, 0), "s"),
+    color = "darkgreen", hjust = 0, size = 3
+  ) +
+  # Recovery time vline
+  {if (!is.na(summary_df$recovery_time))
+    geom_vline(
+      xintercept = summary_df$recovery_time,
+      linetype = "dashed", color = "red", linewidth = 0.8
+    )} +
+  {if (!is.na(summary_df$recovery_time))
+    annotate(
+      "text",
+      x = summary_df$recovery_time + 50,
+      y = 1.1,
+      label = paste("Recovery:", round(summary_df$recovery_time, 0), "s"),
+      color = "red", hjust = 0, size = 3
+    )} +
+  scale_color_manual(
+    name = "Individual",
+    values = c("Focal" = "#1F78B4", "Demonstrators (avg)" = "#E31A1C")
+  ) +
+  scale_y_continuous(limits = c(0, 1.1), breaks = c(0, 0.2, 0.4, 0.6, 0.8, 1)) +
+  labs(
+    title = "Proportion of Time Moving (60s sliding window)",
+    x = NULL, y = "Proportion Moving"
+  ) +
+  theme_classic() +
+  theme(
+    axis.text.x = element_blank(),
+    legend.position = "none"
+  )
+
+# Plot 2: Velocity over time
+p2 <- ggplot(temporal_df, aes(x = trial_time, y = velocity_cm_s)) +
+  geom_line(color = "gray40", alpha = 0.7) +
+  geom_smooth(method = "loess", span = 0.1, se = FALSE, color = "#1F78B4") +
+  labs(
+    title = "Velocity Over Time",
+    x = NULL, y = "Velocity (cm/s)"
+  ) +
+  theme_classic() +
+  theme(axis.text.x = element_blank())
+
+# Plot 3: Distance to edge over time
+p3 <- ggplot(temporal_df, aes(x = trial_time, y = dist_to_edge_cm)) +
+  geom_line(color = "gray40", alpha = 0.7) +
+  geom_hline(yintercept = 3, colour = "orange", linetype = "dashed") +
+  geom_smooth(method = "loess", span = 0.1, se = FALSE, color = "#FF7F00") +
+  labs(
+    title = "Distance to Arena Edge (Thigmotaxis)",
+    x = NULL, y = "Distance (cm)"
+  ) +
+  theme_classic() +
+  theme(axis.text.x = element_blank())
+
+# Plot 4: Distance to demonstrator side over time
+p4 <- ggplot(temporal_df, aes(x = trial_time, y = dist_to_top_cm)) +
+  geom_line(color = "gray40", alpha = 0.7) +
+  geom_hline(yintercept = 3, colour = "purple", linetype = "dashed") +
+  geom_smooth(method = "loess", span = 0.1, se = FALSE, color = "#6A3D9A") +
+  labs(
+    title = "Distance to Demonstrator Side (Social Proximity)",
+    x = "Time (s)", y = "Distance (cm)"
+  ) +
+  theme_classic()
+
+# Combine plots
+combined_plot <- (p1 / p2 / p3 / p4 +
+  plot_annotation(
+    subtitle = sprintf(
+      "Focal moving: %.1f%% | Demo moving: %.1f%% | Near edge: %.1f%% | Near demonstrator: %.1f%% | Recovery: %s",
+      summary_df$prop_time_moving * 100,
+      summary_df$prop_time_moving_demonstrators * 100,
+      summary_df$prop_time_near_edge * 100,
+      summary_df$prop_time_near_demonstrator * 100,
+      ifelse(is.na(summary_df$recovery_time), "none",
+             paste0(round(summary_df$recovery_time), "s"))
+    )
+  ))
+
+combined_plot 
+
+ggsave("./3-figs/combined_plot.png", combined_plot, height = 6, width = 10, dpi = 300)
+```
+
+
+
+## 5.2 Batch process all smoothed tracks
+
+```{r batch_process_all_tracks}
+# Parameters
+thigmotaxis_threshold_cm <- 3
+proximity_threshold_cm <- 3
+sliding_window_seconds <- 60
+
+# Get all behaviour track files (with HMM-decoded behavioural states)
+smoothed_track_dir <- "./2-data/3-behaviour_tracks"
+
+smoothed_files <- list.files(
+  path = smoothed_track_dir,
+  pattern = "\\.csv$",
+  full.names = TRUE) |>
+  (\(x) x[!grepl("^\\._", basename(x))])()
+
+cat(sprintf("Found %d behaviour track files\n", length(smoothed_files)))
+
+# Function to process a single track
+process_track <- function(csv_path) {
+  session_name <- tools::file_path_sans_ext(basename(csv_path))
+  
+  # Read the track
+  track_df <- tryCatch(
+    read_csv(csv_path, show_col_types = FALSE),
+    error = function(e) {
+      warning(sprintf("Failed to read %s: %s", session_name, e$message))
+      return(NULL)
+    }
+  )
+  
+  if (is.null(track_df)) return(NULL)
+
+  # Check if phase column exists
+  if (!"phase" %in% names(track_df)) {
+    warning(sprintf("No phase column in %s", session_name))
+    return(NULL)
+  }
+  
+  # Check if required columns exist
+  required_cols <- c("time", "x_smooth_ind1", "y_smooth_ind1", "velocity_ind1", 
+                     "behaviour_ind1", "dist_to_edge_cm", "dist_to_top_cm")
+  if (!all(required_cols %in% names(track_df))) {
+    warning(sprintf("Missing required columns in %s", session_name))
+    return(NULL)
+  }
+  
+  # Determine the time range where tracking data exists for ANY individual
+  # Determine the time range where the FOCAL fish (ind1) has valid tracking data
+  # This ensures the temporal_df only covers the period when the focal fish is present
+  # (demonstrators may start earlier in trial sessions)
+  track_df_with_valid <- track_df |>
+    mutate(
+      has_valid_data = !is.na(x_smooth_ind1) & !is.na(y_smooth_ind1)
+    )
+  
+  valid_indices <- which(track_df_with_valid$has_valid_data)
+  
+  if (length(valid_indices) == 0) {
+    warning(sprintf("No valid tracking data found in %s", session_name))
+    return(NULL)
+  }
+  
+  first_valid_time <- track_df_with_valid$time[min(valid_indices)]
+  last_valid_time <- track_df_with_valid$time[max(valid_indices)]
+  
+  # Filter track_df to only include data within the valid time range
+  track_df_filtered <- track_df |>
+    filter(time >= first_valid_time & time <= last_valid_time)
+  
+  # Aggregate to per-second values
+  temporal_df <- track_df_filtered |>
+    mutate(second = floor(time)) |>
+    group_by(second) |>
+    summarise(
+      # Position (mean per second)
+      x_cm = mean(x_smooth_ind1, na.rm = TRUE),
+      y_cm = mean(y_smooth_ind1, na.rm = TRUE),
+      
+      # Velocity (mean per second)
+      velocity_cm_s = mean(velocity_ind1, na.rm = TRUE),
+      
+      # behavioural state - proportion of frames moving in this second
+      n_frames = n(),
+      n_moving = sum(behaviour_ind1 == "moving", na.rm = TRUE),
+      prop_moving_instant = n_moving / n_frames,
+      
+      # Demonstrator behavioural states - proportion of frames moving
+      n_moving_ind2 = if ("behaviour_ind2" %in% names(track_df)) sum(behaviour_ind2 == "moving", na.rm = TRUE) else NA_real_,
+      prop_moving_instant_ind2 = if ("behaviour_ind2" %in% names(track_df)) n_moving_ind2 / n_frames else NA_real_,
+      
+      n_moving_ind3 = if ("behaviour_ind3" %in% names(track_df)) sum(behaviour_ind3 == "moving", na.rm = TRUE) else NA_real_,
+      prop_moving_instant_ind3 = if ("behaviour_ind3" %in% names(track_df)) n_moving_ind3 / n_frames else NA_real_,
+      
+      n_moving_ind4 = if ("behaviour_ind4" %in% names(track_df)) sum(behaviour_ind4 == "moving", na.rm = TRUE) else NA_real_,
+      prop_moving_instant_ind4 = if ("behaviour_ind4" %in% names(track_df)) n_moving_ind4 / n_frames else NA_real_,
+      
+      # Spatial metrics (mean per second)
+      dist_to_edge_cm = mean(dist_to_edge_cm, na.rm = TRUE),
+      dist_to_top_cm = mean(dist_to_top_cm, na.rm = TRUE),
+      
+      # Binary thigmotaxis (proportion of frames within threshold)
+      prop_near_edge = mean(dist_to_edge_cm < thigmotaxis_threshold_cm, na.rm = TRUE),
+      
+      # Binary social proximity (proportion of frames within threshold)
+      prop_near_demonstrator = mean(dist_to_top_cm < proximity_threshold_cm, na.rm = TRUE),
+      
+      # behavioural states for demonstrators
+      # Convert to numeric: moving = 1, freezing = 0
+      behaviour_ind1_numeric = mean(behaviour_ind1 == "moving", na.rm = TRUE),
+      behaviour_ind2_numeric = if ("behaviour_ind2" %in% names(track_df)) mean(behaviour_ind2 == "moving", na.rm = TRUE) else NA_real_,
+      behaviour_ind3_numeric = if ("behaviour_ind3" %in% names(track_df)) mean(behaviour_ind3 == "moving", na.rm = TRUE) else NA_real_,
+      behaviour_ind4_numeric = if ("behaviour_ind4" %in% names(track_df)) mean(behaviour_ind4 == "moving", na.rm = TRUE) else NA_real_,
+      
+      .groups = "drop"
+    ) |>
+    rename(time = second) |>
+    arrange(time)
+  
+  # Add trial_time column (starts at 0 from first valid tracking data)
+  first_time_in_temporal <- min(temporal_df$time)
+  temporal_df <- temporal_df |>
+    mutate(trial_time = time - first_time_in_temporal)
+  
+  # Calculate sliding window proportion of time moving
+  temporal_df <- temporal_df |>
+    mutate(
+      prop_moving_sliding = zoo::rollapply(
+        prop_moving_instant,
+        width = sliding_window_seconds,
+        FUN = mean,
+        fill = NA,
+        align = "center",
+        na.rm = TRUE,
+        partial = TRUE
+      ),
+      
+      # Demonstrator sliding window proportions
+      prop_moving_sliding_ind2 = zoo::rollapply(
+        prop_moving_instant_ind2,
+        width = sliding_window_seconds,
+        FUN = mean,
+        fill = NA,
+        align = "center",
+        na.rm = TRUE,
+        partial = TRUE
+      ),
+      
+      prop_moving_sliding_ind3 = zoo::rollapply(
+        prop_moving_instant_ind3,
+        width = sliding_window_seconds,
+        FUN = mean,
+        fill = NA,
+        align = "center",
+        na.rm = TRUE,
+        partial = TRUE
+      ),
+      
+      prop_moving_sliding_ind4 = zoo::rollapply(
+        prop_moving_instant_ind4,
+        width = sliding_window_seconds,
+        FUN = mean,
+        fill = NA,
+        align = "center",
+        na.rm = TRUE,
+        partial = TRUE
+      ),
+      
+      # Average demonstrator sliding window proportion
+      prop_moving_sliding_demonstrators = rowMeans(
+        cbind(prop_moving_sliding_ind2, prop_moving_sliding_ind3, prop_moving_sliding_ind4),
+        na.rm = TRUE
+      )
+    )
+  
+  # Add metadata columns
+  temporal_df <- temporal_df |>
+    mutate(
+      session_name = session_name,
+      day = track_df$day[1],
+      trial = track_df$trial[1],
+      camera = track_df$camera[1],
+      phase = track_df$phase[1],
+      ID = track_df$ID[1],
+      treatment = track_df$treatment[1],
+      information = track_df$information[1]
+    )
+  
+  # Calculate whole-trial summary metrics
+  summary_df <- temporal_df |>
+    summarise(
+      # Metadata
+      session_name = first(session_name),
+      day = first(day),
+      trial = first(trial),
+      camera = first(camera),
+      phase = first(phase),
+      ID = first(ID),
+      treatment = first(treatment),
+      information = first(information),
+      
+      # Trial duration
+      duration_s = max(time) - min(time) + 1,
+      
+      # ===== FREEZING METRICS =====
+      total_time_moving = sum(prop_moving_instant > 0.5, na.rm = TRUE),
+      prop_time_moving = total_time_moving / duration_s,
+      latency_to_moving = {
+        idx <- which(prop_moving_sliding > 0.5)
+        if (length(idx) > 0) trial_time[min(idx)] else NA_real_
+      },
+      mean_velocity_cm = mean(velocity_cm_s, na.rm = TRUE),
+      
+      # ===== REACTION TIME (time to first freeze) =====
+      # Time until focal fish first freezes (sliding window proportion <= 0.5)
+      reaction_time_ind1 = {
+        idx <- which(behaviour_ind1_numeric <= 0.5)
+        if (length(idx) > 0) trial_time[min(idx)] else NA_real_
+      },
+      # Distance from demonstrators at time of first freeze
+      reaction_distance_from_dems = {
+        idx <- which(behaviour_ind1_numeric <= 0.5)
+        if (length(idx) > 0) dist_to_top_cm[min(idx)] else NA_real_
+      },
+      # Reaction time for each demonstrator
+      reaction_time_ind2 = {
+        idx <- which(behaviour_ind2_numeric <= 0.5)
+        if (length(idx) > 0) trial_time[min(idx)] else NA_real_
+      },
+      reaction_time_ind3 = {
+        idx <- which(behaviour_ind3_numeric <= 0.5)
+        if (length(idx) > 0) trial_time[min(idx)] else NA_real_
+      },
+      reaction_time_ind4 = {
+        idx <- which(behaviour_ind4_numeric <= 0.5)
+        if (length(idx) > 0) trial_time[min(idx)] else NA_real_
+      },
+      # Average reaction time across demonstrators
+      reaction_time_demonstrators = mean(
+        c(reaction_time_ind2, reaction_time_ind3, reaction_time_ind4),
+        na.rm = TRUE
+      ),
+      
+      # ===== DEMONSTRATOR FREEZING METRICS =====
+      # Proportion of time moving for each demonstrator
+      prop_time_moving_ind2 = mean(prop_moving_instant_ind2 > 0.5, na.rm = TRUE),
+      prop_time_moving_ind3 = mean(prop_moving_instant_ind3 > 0.5, na.rm = TRUE),
+      prop_time_moving_ind4 = mean(prop_moving_instant_ind4 > 0.5, na.rm = TRUE),
+      
+      # Average proportion of time moving across demonstrators
+      prop_time_moving_demonstrators = mean(c(prop_time_moving_ind2, prop_time_moving_ind3, prop_time_moving_ind4), na.rm = TRUE),
+      
+      # Latency to moving for each demonstrator
+      latency_to_moving_ind2 = {
+        idx <- which(prop_moving_sliding_ind2 > 0.5)
+        if (length(idx) > 0) trial_time[min(idx)] else NA_real_
+      },
+      latency_to_moving_ind3 = {
+        idx <- which(prop_moving_sliding_ind3 > 0.5)
+        if (length(idx) > 0) trial_time[min(idx)] else NA_real_
+      },
+      latency_to_moving_ind4 = {
+        idx <- which(prop_moving_sliding_ind4 > 0.5)
+        if (length(idx) > 0) trial_time[min(idx)] else NA_real_
+      },
+      
+      # Average latency to moving across demonstrators
+      latency_to_moving_demonstrators = mean(c(latency_to_moving_ind2, latency_to_moving_ind3, latency_to_moving_ind4), na.rm = TRUE),
+      
+      # ===== THIGMOTAXIS METRICS =====
+      total_time_near_edge = sum(prop_near_edge > 0.5, na.rm = TRUE),
+      prop_time_near_edge = total_time_near_edge / duration_s,
+      mean_dist_to_edge_cm = mean(dist_to_edge_cm, na.rm = TRUE),
+      
+      # ===== SOCIAL PROXIMITY METRICS =====
+      total_time_near_demonstrator = sum(prop_near_demonstrator > 0.5, na.rm = TRUE),
+      prop_time_near_demonstrator = total_time_near_demonstrator / duration_s,
+      mean_dist_to_top_cm = mean(dist_to_top_cm, na.rm = TRUE)
+    )
+  
+  # ===== RECOVERY TIME (CHANGEPOINT DETECTION) =====
+  # Only meaningful for trial sessions – we compare against the matching baseline
+  phase_label <- temporal_df$phase[1]
+  
+  if (!is.na(phase_label) && phase_label == "trial") {
+    # Build the baseline file path (swap "-t-" for "-b-" in the session name)
+    baseline_session <- stringr::str_replace(session_name, "-t-", "-b-")
+    baseline_path <- file.path(dirname(csv_path), paste0(baseline_session, ".csv"))
+    
+    baseline_temporal <- NULL
+    if (file.exists(baseline_path)) {
+      bl_raw <- tryCatch(
+        read_csv(baseline_path, show_col_types = FALSE),
+        error = function(e) NULL
+      )
+      if (!is.null(bl_raw) && nrow(bl_raw) > 0) {
+        # Trim baseline to the standardised 300-1500 s window
+        bl_raw <- bl_raw |> filter(between(time, 300, 1500))
+        
+        # Aggregate baseline to per-second (mirrors the trial temporal_df)
+        baseline_temporal <- bl_raw |>
+          mutate(second = floor(time)) |>
+          group_by(second) |>
+          summarise(
+            velocity_cm_s = mean(velocity_ind1, na.rm = TRUE),
+            behaviour_ind1_numeric = mean(behaviour_ind1 == "moving", na.rm = TRUE),
+            behaviour_ind2_numeric = if ("behaviour_ind2" %in% names(bl_raw)) mean(behaviour_ind2 == "moving", na.rm = TRUE) else NA_real_,
+            behaviour_ind3_numeric = if ("behaviour_ind3" %in% names(bl_raw)) mean(behaviour_ind3 == "moving", na.rm = TRUE) else NA_real_,
+            behaviour_ind4_numeric = if ("behaviour_ind4" %in% names(bl_raw)) mean(behaviour_ind4 == "moving", na.rm = TRUE) else NA_real_,
+            .groups = "drop"
+          ) |>
+          rename(time = second)
+      }
+    }
+    
+    # --- Focal recovery ---
+    focal_recovery <- detect_recovery_time(
+      trial_temporal = temporal_df,
+      baseline_temporal = baseline_temporal,
+      velocity_col = "velocity_cm_s",
+      moving_col = "behaviour_ind1_numeric"
+    )
+    
+    # --- Demonstrator recovery (ind2, ind3, ind4) ---
+    demo_recovery <- lapply(c("ind2", "ind3", "ind4"), function(ind) {
+      vel_col <- "velocity_cm_s" # demonstrators share focal velocity proxy
+      move_col <- paste0("behaviour_", ind, "_numeric")
+      
+      # Only attempt if the column exists in the trial temporal_df
+      if (!move_col %in% names(temporal_df)) {
+        return(list(recovery_time = NA_real_,
+                    returned_to_baseline = FALSE,
+                    baseline_prop_moving_sd = NA_real_))
+      }
+      
+      # Build a mini baseline_temporal for this demonstrator
+      bl_temp <- baseline_temporal
+      if (!is.null(bl_temp) && !move_col %in% names(bl_temp)) bl_temp <- NULL
+      
+      detect_recovery_time(
+        trial_temporal = temporal_df,
+        baseline_temporal = bl_temp,
+        velocity_col = vel_col,
+        moving_col = move_col
+      )
+    })
+    names(demo_recovery) <- c("ind2", "ind3", "ind4")
+    
+    # Append recovery columns to summary_df
+    summary_df <- summary_df |>
+      mutate(
+        # ===== FOCAL RECOVERY =====
+        recovery_time = focal_recovery$recovery_time,
+        returned_to_baseline = focal_recovery$returned_to_baseline,
+        recovery_similarity_before = focal_recovery$similarity_before,
+        recovery_similarity_after = focal_recovery$similarity_after,
+        baseline_velocity_mean = focal_recovery$baseline_velocity_mean,
+        baseline_velocity_sd = focal_recovery$baseline_velocity_sd,
+        baseline_prop_moving_mean = focal_recovery$baseline_prop_moving_mean,
+        baseline_prop_moving_sd = focal_recovery$baseline_prop_moving_sd,
+        
+        # ===== DEMONSTRATOR RECOVERY =====
+        recovery_time_ind2 = demo_recovery$ind2$recovery_time,
+        returned_to_baseline_ind2 = demo_recovery$ind2$returned_to_baseline,
+        baseline_prop_moving_sd_ind2 = demo_recovery$ind2$baseline_prop_moving_sd,
+    
+        recovery_time_ind3 = demo_recovery$ind3$recovery_time,
+        returned_to_baseline_ind3 = demo_recovery$ind3$returned_to_baseline,
+        baseline_prop_moving_sd_ind3 = demo_recovery$ind3$baseline_prop_moving_sd,
+        
+        recovery_time_ind4 = demo_recovery$ind4$recovery_time,
+        returned_to_baseline_ind4 = demo_recovery$ind4$returned_to_baseline,
+        baseline_prop_moving_sd_ind4 = demo_recovery$ind4$baseline_prop_moving_sd,
+        
+        # Average demonstrator recovery time
+        recovery_time_demonstrators = mean(
+          c(demo_recovery$ind2$recovery_time,
+            demo_recovery$ind3$recovery_time,
+            demo_recovery$ind4$recovery_time),
+          na.rm = TRUE
+        ),
+        
+        # ===== PRE-RECOVERY SPATIAL METRICS =====
+        # Seconds near edge before recovery (or full trial if no recovery)
+        time_near_edge_pre_recovery = {
+          cutoff <- ifelse(is.na(focal_recovery$recovery_time),
+                           max(temporal_df$time), focal_recovery$recovery_time)
+          sum(temporal_df$prop_near_edge[temporal_df$time <= cutoff] > 0.5, na.rm = TRUE)
+        },
+        # Seconds near demonstrator before recovery (or full trial if no recovery)
+        time_near_demonstrator_pre_recovery = {
+          cutoff <- ifelse(is.na(focal_recovery$recovery_time),
+                           max(temporal_df$time), focal_recovery$recovery_time)
+          sum(temporal_df$prop_near_demonstrator[temporal_df$time <= cutoff] > 0.5, na.rm = TRUE)
+        },
+        # Seconds spent moving before recovery (or full trial if no recovery)
+        time_moving_pre_recovery = {
+          cutoff <- ifelse(is.na(focal_recovery$recovery_time),
+                           max(temporal_df$time), focal_recovery$recovery_time)
+          sum(temporal_df$prop_moving_instant[temporal_df$time <= cutoff] > 0.5, na.rm = TRUE)
+        },
+        # Mean distance to edge before recovery
+        mean_dist_to_edge_pre_recovery = {
+          cutoff <- ifelse(is.na(focal_recovery$recovery_time),
+                           max(temporal_df$time), focal_recovery$recovery_time)
+          mean(temporal_df$dist_to_edge_cm[temporal_df$time <= cutoff], na.rm = TRUE)
+        },
+        # Mean distance to demonstrator before recovery
+        mean_dist_to_demonstrator_pre_recovery = {
+          cutoff <- ifelse(is.na(focal_recovery$recovery_time),
+                           max(temporal_df$time), focal_recovery$recovery_time)
+          mean(temporal_df$dist_to_top_cm[temporal_df$time <= cutoff], na.rm = TRUE)
+        }
+      )
+  } else {
+    # Baseline sessions: fill recovery columns with NA
+    summary_df <- summary_df |>
+      mutate(
+        recovery_time = NA_real_,
+        returned_to_baseline = NA,
+        recovery_similarity_before = NA_real_,
+        recovery_similarity_after = NA_real_,
+        baseline_velocity_mean = NA_real_,
+        baseline_velocity_sd = NA_real_,
+        baseline_prop_moving_mean = NA_real_,
+        baseline_prop_moving_sd = NA_real_,
+        recovery_time_ind2 = NA_real_,
+        returned_to_baseline_ind2 = NA,
+        baseline_prop_moving_sd_ind2 = NA_real_,
+        recovery_time_ind3 = NA_real_,
+        returned_to_baseline_ind3 = NA,
+        baseline_prop_moving_sd_ind3 = NA_real_,
+        recovery_time_ind4 = NA_real_,
+        returned_to_baseline_ind4 = NA,
+        baseline_prop_moving_sd_ind4 = NA_real_,
+        recovery_time_demonstrators = NA_real_,
+        time_near_edge_pre_recovery = NA_real_,
+        time_near_demonstrator_pre_recovery = NA_real_,
+        time_moving_pre_recovery = NA_real_,
+        mean_dist_to_edge_pre_recovery = NA_real_,
+        mean_dist_to_demonstrator_pre_recovery = NA_real_
+      )
+  }
+  
+  return(list(temporal = temporal_df, summary = summary_df))
+}
+
+# Set up parallel processing
+plan(multisession, workers = max(1, availableCores() - 1))
+
+cat(sprintf("Processing tracks using %d CPU cores...\n", nbrOfWorkers()))
+
+# Process all tracks in parallel
+results <- future_map(
+  smoothed_files,
+  process_track,
+  .options = furrr_options(seed = TRUE),
+  .progress = TRUE
+)
+
+# Reset to sequential processing
+plan(sequential)
+
+# Filter out NULL results and separate temporal and summary data
+results_valid <- results[!sapply(results, is.null)]
+
+cat(sprintf("\nSuccessfully processed %d tracks out of %d total files\n", 
+            length(results_valid), length(smoothed_files)))
+
+# Combine all temporal dataframes
+temporal_df <- map_dfr(results_valid, ~.x$temporal)
+
+# Combine all summary dataframes
+summary_df <- map_dfr(results_valid, ~.x$summary)
+```
+
+## 5.3 Attached morphs
+
+```{r}
+morphs_raw <- read_csv("./2-data/morphs.csv") |> 
+  rename(demonstrator_id = demonstrator) |> 
+  select(session_name, weight, demonstrator_id)
+
+# The morphs file only contains trial-phase session names (with "-t-")
+# We need to also create baseline versions (with "-b-") since the weight 
+# and demonstrator_id are the same for both phases of the same fish
+morphs_trial <- morphs_raw
+
+morphs_baseline <- morphs_raw |>
+  mutate(session_name = str_replace(session_name, "-t-", "-b-"))
+
+# Combine trial and baseline morphs
+morphs <- bind_rows(morphs_trial, morphs_baseline)
+
+cat(sprintf("Morphs data expanded from %d trial sessions to %d total (trial + baseline)\n",
+            nrow(morphs_trial), nrow(morphs)))
+
+all_temporal_morph_df <- merge(temporal_df, morphs, by ="session_name") |> 
+  mutate(time = time/60,
+         trial_time = trial_time/60)
+
+all_summary_morph_df <- merge(summary_df, morphs, by ="session_name") |> 
+  mutate(duration_m = duration_s/60,
+         across(c(total_time_moving, starts_with("latency"), starts_with("recovery_time"),
+                  starts_with("time_"), total_time_near_edge, total_time_near_demonstrator),
+                ~ .x / 60))
+
+cat(sprintf("Temporal data: %d rows (from %d before morph merge)\n", 
+            nrow(all_temporal_morph_df), nrow(temporal_df)))
+cat(sprintf("Summary data: %d rows (from %d before morph merge)\n", 
+            nrow(all_summary_morph_df), nrow(summary_df)))
+```
+
+
+## 5.4 Create blinded versions of the data
+
+This section creates blinded versions of both dataframes where treatment and information levels are randomized. A key file is saved that can be used to unblind the data after analysis.
+
+```{r blind_data}
+set.seed(9)
+
+# Create random blinding codes for treatment levels
+treatment_levels <- c("c", "l", "h")
+treatment_blind_codes <- c("TX", "TY", "TZ") 
+treatment_shuffled <- sample(treatment_blind_codes) 
+
+# Create random blinding codes for information levels
+information_levels <- c("personal", "social")
+information_blind_codes <- c("IA", "IB")
+information_shuffled <- sample(information_blind_codes)
+
+# Create blinding key (mapping from real to blinded)
+blinding_key <- tibble(
+  variable = c(rep("treatment", 3), rep("information", 2)),
+  original = c(treatment_levels, information_levels),
+  blinded = c(treatment_shuffled, information_shuffled))
+
+# Function to apply blinding to a dataframe
+apply_blinding <- function(df, blinding_key) {
+  df_blinded <- df
+  
+  # Remove "-focal" suffix from session_name and ID before blinding
+  df_blinded$session_name <- gsub("-focal$", "", df_blinded$session_name)
+  if ("ID" %in% names(df_blinded)) {
+    df_blinded$ID <- gsub("-focal$", "", df_blinded$ID)
+  }
+  
+  # Blind treatment
+  treatment_map <- setNames(
+    blinding_key$blinded[blinding_key$variable == "treatment"],
+    blinding_key$original[blinding_key$variable == "treatment"]
+  )
+  df_blinded$treatment <- treatment_map[df_blinded$treatment]
+  
+  # Blind information
+  information_map <- setNames(
+    blinding_key$blinded[blinding_key$variable == "information"],
+    blinding_key$original[blinding_key$variable == "information"]
+  )
+  df_blinded$information <- information_map[df_blinded$information]
+  
+  # Blind session_name and ID (replace original codes with blinded ones)
+  for (i in 1:nrow(blinding_key)) {
+    pattern <- blinding_key$original[i]
+    replacement <- blinding_key$blinded[i]
+    df_blinded$session_name <- gsub(pattern, replacement, df_blinded$session_name)
+    if ("ID" %in% names(df_blinded)) {
+      df_blinded$ID <- gsub(pattern, replacement, df_blinded$ID)
+    }
+  }
+  
+  return(df_blinded)
+}
+
+temporal_df_blinded <- apply_blinding(all_temporal_morph_df, blinding_key)
+summary_df_blinded <- apply_blinding(all_summary_morph_df, blinding_key)
+
+write_csv(temporal_df_blinded, "./2-data/temporal_data.csv")
+write_csv(summary_df_blinded, "./2-data/summary_data.csv")
+write_csv(blinding_key, "./2-data/BLINDING_KEY.csv")
+```
+
+

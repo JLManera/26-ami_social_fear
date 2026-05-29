@@ -1,0 +1,18 @@
+# Python dependencies for helper scripts in 4-assisting_code/
+# Requires Python 3.10+
+#
+# Per-script usage:
+#   batch_tracker.py           - standard library only
+#   calibrator.py              - PyQt5, matplotlib
+#   glitch_detection_app.py    - opencv-python, numpy, Pillow (tkinter is stdlib)
+#   overlay_smoothed_tracks.py - opencv-python, numpy, pandas, tqdm
+#   stationary_fish_tracker.py - opencv-python, numpy, toml
+
+matplotlib>=3.7
+numpy>=1.24
+opencv-python>=4.8
+pandas>=2.0
+Pillow>=10.0
+PyQt5>=5.15
+toml>=0.10
+tqdm>=4.65

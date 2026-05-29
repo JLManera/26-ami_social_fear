@@ -1,0 +1,105 @@
+---
+title: "water_analysis"
+format: html
+---
+
+# 1. Setup
+
+##1.1 Install & Load Required Packages
+
+Load packages for data manipulation, plotting, spatial operations, smoothing, and file I/O. Includes a helper function to extract elements from split strings.
+
+```{r packages}
+#If 'pacman' is not already installed please un-hash and run the line below
+#install.packages("pacman")
+
+# Core packages for manipulation and plotting
+pacman::p_load(tidyverse, ggplot2, brms, cmdstanr, bayestestR, tidybayes, ggpp, marginaleffects, grid, patchwork, officer, flextable, install = TRUE)
+
+colour_treatment1 <- "#238f9d"
+colour_treatment2 <- "#f57634"
+colour_treatment3 <- "#a01813"
+```
+
+## 1.2 Read in data
+```{r}
+concentrations_df <- read_csv("./2-data/water_analysis_results.csv") |> 
+  filter(!is.na(Reference)) |> 
+  mutate(amitriptyline = as.numeric(ifelse(`Amitriptyline (ng/L)` == "<10", 0, `Amitriptyline (ng/L)`)),
+         treatment = factor(substr(`Sample Description`, 2,2), levels = c("c", "l", "h")),
+         batch = substr(`Sample Description`, 1,1),
+         day_of_exposure = as.numeric(str_split_i(`Date Sampled`, "/", 1)) - as.numeric(batch) -2,
+         day_since_dose = ifelse(day_of_exposure >= 6, day_of_exposure - 6, day_of_exposure))
+```
+
+```{r, warning=FALSE, message=FALSE}
+p1 <- ggplot(data = concentrations_df, aes(x = day_of_exposure, y = amitriptyline, colour = treatment))+
+  geom_vline(xintercept = 1, colour = "blue") +
+  geom_vline(xintercept = 6, colour = "blue") +
+  geom_smooth() +
+  theme_classic() +
+  scale_colour_manual(values = c("c" = colour_treatment1, "l" = colour_treatment2, "h" = colour_treatment3),labels = c("Control", "Low", "High")) +
+  coord_cartesian(xlim = c(1,10))
+
+p1
+```
+
+```{r}
+concentration_formula <- bf((amitriptyline + 0.005) ~ treatment*day_since_dose + (1 | batch), family = Gamma(link = "log"))
+
+concentration_model <- brm(concentration_formula, 
+  data = concentrations_df,
+  control = list(adapt_delta = 0.95, max_treedepth = 12), 
+  iter = 6000, warmup = 4000, 
+  threads = threading(2),
+  chains = 4, cores = 4,
+  backend = 'cmdstanr',
+  file = "./2-data/4-models/concentration_model",
+  seed = 9)
+```
+
+```{r}
+summary(concentration_model)
+pp_check(concentration_model)
+```
+
+```{r, fig.width=3, fig.height=3}
+concentration_marginal_means <- avg_predictions(concentration_model, by = c("treatment"), type = "response",
+  re_formula = NA) |> 
+  as.data.frame()
+concentration_marginal_means
+
+concentration_marginal_means_draws <- concentration_marginal_means |>
+  get_draws() |> 
+  rename(amitriptyline = draw) |> 
+  mutate(treatment = case_when(treatment == "c" ~ "Control", treatment == "l" ~ "Low", treatment == "h" ~ "High"),
+         treatment = factor(treatment, levels = c("Control", "Low", "High")))
+  
+
+concentration_plot <- ggplot(data = concentration_marginal_means_draws, aes(x = treatment, y = amitriptyline, colour = treatment)) +
+  stat_halfeye(.width = 0.95, size = 4, fill = NA) +
+  stat_halfeye(.width = 0, size = 9, fill = NA)+
+  geom_hline(yintercept = 300, colour = colour_treatment3, linetype = "dashed")+
+  geom_hline(yintercept = 30, colour = colour_treatment2, linetype = "dashed")+
+  geom_hline(yintercept = 0, colour = colour_treatment1, linetype = "dashed")+
+  scale_colour_manual(values = c(colour_treatment1, colour_treatment2, colour_treatment3)) +
+  labs(y = expression("Amitriptyline conc. (ng L"^-1*")"),
+       x = "Treatment group",
+       colour = "Amitriptyline\nconcentration") +
+  theme_classic(base_size = 13) +
+  theme(legend.position = "none",
+      axis.line = element_blank(),
+      axis.text.x = element_text(size = 10),
+      axis.title.x = element_blank(),
+      panel.background = element_rect(fill = NA),
+      panel.border = element_rect(colour = "black", fill = NA, linewidth = 1.1)) +
+  coord_cartesian(ylim = c(0, 345))
+
+concentration_plot
+```
+
+```{r}
+ggsave("./3-figs/supplementary_water_concs.png", concentration_plot, width = 3, height = 3, dpi = 300)
+```
+
+
